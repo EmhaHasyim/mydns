@@ -10,7 +10,7 @@ use bytes::{Buf, Bytes};
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -21,24 +21,44 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_MESSAGE: usize = 65_535;
 
-fn tls_config(alpn: &[&str]) -> Arc<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    cfg.alpn_protocols = alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
-    Arc::new(cfg)
+/// Kunci untuk state kecil yang tidak pernah menunggu I/O. Poison diabaikan:
+/// isinya tetap konsisten, dan satu panic tidak boleh mematikan resolver.
+fn guard<T>(lock: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn quic_client_config(alpn: &str) -> Result<quinn::ClientConfig, String> {
+/// Konfigurasi TLS per ALPN dirakit sekali saja: root store WebPKI berisi
+/// ratusan sertifikat dan tidak perlu dibangun ulang tiap koneksi dipulihkan.
+fn tls_config(alpn: &'static str) -> Arc<rustls::ClientConfig> {
+    static DOQ: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    static H3: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    static H2: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+
+    let slot = match alpn {
+        "doq" => &DOQ,
+        "h3" => &H3,
+        _ => &H2,
+    };
+    slot.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+        Arc::new(cfg)
+    })
+    .clone()
+}
+
+fn quic_client_config(alpn: &'static str) -> Result<quinn::ClientConfig, String> {
     let idle: quinn::IdleTimeout = Duration::from_secs(25)
         .try_into()
         .map_err(|_| "idle timeout tidak valid".to_string())?;
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(idle));
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*tls_config(&[alpn])).clone())
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*tls_config(alpn)).clone())
         .map_err(|e| format!("konfigurasi TLS: {e}"))?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
     cfg.transport_config(Arc::new(transport));
@@ -64,14 +84,15 @@ type Job = (Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>);
 pub struct Engine {
     ep: quinn::Endpoint,
     prov: &'static Provider,
+    /// Satu-satunya kunci async: guard-nya dipegang selama handshake QUIC.
     doq: Mutex<Option<quinn::Connection>>,
-    h3: Mutex<Option<mpsc::Sender<Job>>>,
-    h2: Mutex<Option<h2::client::SendRequest<Bytes>>>,
-    preferred: std::sync::Mutex<Option<Proto>>,
+    h3: StdMutex<Option<mpsc::Sender<Job>>>,
+    h2: StdMutex<Option<h2::client::SendRequest<Bytes>>>,
+    preferred: StdMutex<Option<Proto>>,
     /// Berapa kali sebuah protokol gagal berturut-turut dan kapan terakhir.
     /// Setelah dua kali, protokol itu dilewati sementara supaya fallback tidak
     /// membuang waktu tiap query.
-    failures: Mutex<HashMap<Proto, (u8, Instant)>>,
+    failures: StdMutex<HashMap<Proto, (u8, Instant)>>,
 }
 
 impl Engine {
@@ -82,10 +103,10 @@ impl Engine {
             ep,
             prov,
             doq: Mutex::new(None),
-            h3: Mutex::new(None),
-            h2: Mutex::new(None),
-            preferred: std::sync::Mutex::new(None),
-            failures: Mutex::new(HashMap::new()),
+            h3: StdMutex::new(None),
+            h2: StdMutex::new(None),
+            preferred: StdMutex::new(None),
+            failures: StdMutex::new(HashMap::new()),
         }))
     }
 
@@ -94,27 +115,25 @@ impl Engine {
     pub async fn resolve(&self, query: &[u8]) -> Result<(Vec<u8>, Proto), String> {
         let mut order = self.prov.protos();
         {
-            let failures = self.failures.lock().await;
-            let filtered: Vec<Proto> = order
-                .iter()
-                .copied()
-                .filter(|p| match failures.get(p) {
-                    // Dilewati hanya sementara: gangguan jaringan sesaat tidak
-                    // boleh mematikan DoQ untuk seluruh sesi.
-                    Some((count, when)) => *count < 2 || when.elapsed() > FAILURE_COOLDOWN,
-                    None => true,
-                })
-                .collect();
-            if !filtered.is_empty() {
-                order = filtered;
+            let failures = guard(&self.failures);
+            let usable = |proto: &Proto| match failures.get(proto) {
+                // Dilewati hanya sementara: gangguan jaringan sesaat tidak
+                // boleh mematikan DoQ untuk seluruh sesi.
+                Some((count, when)) => *count < 2 || when.elapsed() > FAILURE_COOLDOWN,
+                None => true,
+            };
+            order.retain(usable);
+            // Kalau semua protokol sedang dikarantina, tetap coba semuanya
+            // daripada gagal tanpa satu percobaan pun.
+            if order.is_empty() {
+                order = self.prov.protos();
             }
         }
-        if let Ok(guard) = self.preferred.lock()
-            && let Some(last) = *guard
+        if let Some(last) = *guard(&self.preferred)
             && let Some(pos) = order.iter().position(|p| *p == last)
         {
-            let p = order.remove(pos);
-            order.insert(0, p);
+            let last_used = order.remove(pos);
+            order.insert(0, last_used);
         }
         if order.is_empty() {
             return Err("provider tidak punya protokol yang didukung".to_string());
@@ -124,10 +143,8 @@ impl Engine {
         for proto in order {
             match self.query_proto(proto, query).await {
                 Ok(resp) if resp.len() >= 12 => {
-                    if let Ok(mut guard) = self.preferred.lock() {
-                        *guard = Some(proto);
-                    }
-                    self.failures.lock().await.remove(&proto);
+                    *guard(&self.preferred) = Some(proto);
+                    guard(&self.failures).remove(&proto);
                     return Ok((resp, proto));
                 }
                 // Respons kosong dan error diperlakukan sama: protokol dicatat
@@ -158,10 +175,11 @@ impl Engine {
     /// menerus — mis. QUIC diblokir jaringan — tidak pernah mengalami overflow.
     async fn note_failure(&self, proto: Proto) {
         self.invalidate(proto).await;
-        let mut failures = self.failures.lock().await;
-        let entry = failures.entry(proto).or_insert((0, Instant::now()));
+        let now = Instant::now();
+        let mut failures = guard(&self.failures);
+        let entry = failures.entry(proto).or_insert((0, now));
         entry.0 = entry.0.saturating_add(1);
-        entry.1 = Instant::now();
+        entry.1 = now;
     }
 
     async fn invalidate(&self, proto: Proto) {
@@ -169,13 +187,11 @@ impl Engine {
             Proto::DoQ => {
                 *self.doq.lock().await = None;
             }
+            // Menjatuhkan sender membuat worker melihat channel tertutup lalu keluar.
             Proto::DoH3 => {
-                // Menjatuhkan sender membuat worker melihat channel tertutup lalu keluar.
-                let _ = self.h3.lock().await.take();
+                let _ = guard(&self.h3).take();
             }
-            Proto::DoH2 => {
-                *self.h2.lock().await = None;
-            }
+            Proto::DoH2 => self.h2_forget(),
         }
     }
 
@@ -245,9 +261,9 @@ impl Engine {
 
     // ---------- DoH3 ----------
 
-    async fn h3_sender(&self) -> Result<mpsc::Sender<Job>, String> {
-        let mut guard = self.h3.lock().await;
-        if let Some(tx) = guard.as_ref()
+    fn h3_sender(&self) -> Result<mpsc::Sender<Job>, String> {
+        let mut slot = guard(&self.h3);
+        if let Some(tx) = slot.as_ref()
             && !tx.is_closed()
         {
             return Ok(tx.clone());
@@ -257,12 +273,12 @@ impl Engine {
         let prov = self.prov;
         let cfg = quic_client_config("h3")?;
         tokio::spawn(async move { h3_worker(ep, cfg, prov, rx).await });
-        *guard = Some(tx.clone());
+        *slot = Some(tx.clone());
         Ok(tx)
     }
 
     async fn doh3_query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
-        let tx = self.h3_sender().await?;
+        let tx = self.h3_sender()?;
         let (otx, orx) = oneshot::channel();
         tx.send((query.to_vec(), otx))
             .await
@@ -282,7 +298,7 @@ impl Engine {
             .doh
             .ok_or_else(|| "provider tidak punya endpoint DoH".to_string())?;
         let host = url_host(url).to_string();
-        let connector = tokio_rustls::TlsConnector::from(tls_config(&["h2"]));
+        let connector = tokio_rustls::TlsConnector::from(tls_config("h2"));
         let mut last = String::from("tidak ada IP bootstrap");
 
         for addr in boots(self.prov, 443) {
@@ -323,16 +339,31 @@ impl Engine {
         Err(format!("DoH {host}: {last}"))
     }
 
-    async fn doh2_query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
-        let mut guard = self.h2.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.h2_connect().await?);
+    /// Ambil koneksi HTTP/2 yang ada, atau buka yang baru.
+    ///
+    /// Satu koneksi HTTP/2 melayani banyak request sekaligus, jadi kunci hanya
+    /// dipegang saat membaca/mengisi slot — bukan selama request berjalan.
+    /// Kalau ditahan, semua query DoH2 mengantre satu per satu.
+    async fn h2_sender(&self) -> Result<h2::client::SendRequest<Bytes>, String> {
+        if let Some(send) = guard(&self.h2).as_ref() {
+            return Ok(send.clone());
         }
+        let send = self.h2_connect().await?;
+        *guard(&self.h2) = Some(send.clone());
+        Ok(send)
+    }
+
+    /// Lupakan koneksi HTTP/2 yang sudah tidak bisa dipakai.
+    fn h2_forget(&self) {
+        *guard(&self.h2) = None;
+    }
+
+    async fn doh2_query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+        let mut send = self.h2_sender().await?;
         let url = self
             .prov
             .doh
             .ok_or_else(|| "provider tidak punya endpoint DoH".to_string())?;
-        let send = guard.as_mut().expect("baru saja diisi");
 
         let req = http::Request::builder()
             .method(http::Method::POST)
@@ -346,7 +377,7 @@ impl Engine {
         let (future, mut body) = match send.send_request(req, false) {
             Ok(v) => v,
             Err(e) => {
-                *guard = None;
+                self.h2_forget();
                 return Err(format!("kirim HTTP/2: {e}"));
             }
         };
@@ -356,11 +387,11 @@ impl Engine {
         let response = match tokio::time::timeout(QUERY_TIMEOUT, future).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                *guard = None;
+                self.h2_forget();
                 return Err(format!("respons HTTP/2: {e}"));
             }
             Err(_) => {
-                *guard = None;
+                self.h2_forget();
                 return Err("timeout".to_string());
             }
         };
@@ -393,7 +424,7 @@ impl Engine {
             let started = Instant::now();
             let resp = self.query_proto(proto, query).await?;
             best = best.min(started.elapsed().as_millis());
-            summary = crate::engine::describe(&resp);
+            summary = describe(&resp);
         }
         Ok((best, summary))
     }

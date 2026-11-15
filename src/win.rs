@@ -275,26 +275,34 @@ fn list_adapters_slow() -> Result<Vec<Adapter>, String> {
     Ok(out)
 }
 
+/// Alamat IPv6 link-local tidak pernah berguna sebagai resolver, dan Windows
+/// melaporkannya untuk hampir setiap adapter. Jalur FFI sudah membuangnya, dan
+/// jalur PowerShell harus memakai aturan yang sama persis.
+fn is_link_local(server: &str) -> bool {
+    match server.parse::<IpAddr>() {
+        Ok(IpAddr::V6(addr)) => addr.is_unicast_link_local(),
+        Ok(IpAddr::V4(_)) => false,
+        // PowerShell kadang menambahkan zone id (`fe80::1%12`) yang tidak bisa
+        // diparse sebagai IpAddr.
+        Err(_) => server.to_ascii_lowercase().starts_with("fe80:"),
+    }
+}
+
+/// Baca daftar DNS dari keluaran JSON PowerShell. Sebagian versi mengirim array,
+/// sebagian lagi satu string bergabung dengan `|`.
 fn split_list(value: Option<&serde_json::Value>) -> Vec<String> {
-    let Some(v) = value else { return Vec::new() };
-    let s = match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => return Vec::new(),
-        other => {
-            // Sebagian PowerShell 5.1 mengirim array, bukan string gabungan.
-            if let Some(arr) = other.as_array() {
-                return arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
-                    .filter(|s| !s.is_empty() && s != "fe80::1")
-                    .collect();
-            }
-            return Vec::new();
-        }
+    let Some(value) = value else {
+        return Vec::new();
     };
-    s.split('|')
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty() && !p.starts_with("fe80:"))
+    let raw: Vec<&str> = match value {
+        serde_json::Value::String(text) => text.split('|').collect(),
+        serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    raw.iter()
+        .map(|server| server.trim())
+        .filter(|server| !server.is_empty() && !is_link_local(server))
+        .map(str::to_string)
         .collect()
 }
 
@@ -505,8 +513,30 @@ pub fn spawn_watchdog() {
 
 /// Pastikan resolver sistem benar-benar menjawab setelah DNS diubah. Dipakai
 /// untuk membatalkan penerapan secara otomatis kalau hasilnya tidak terpakai.
+///
+/// Jalur cepatnya `getaddrinfo` Windows lewat `to_socket_addrs` — jalur yang
+/// sama dengan yang dipakai aplikasi lain, dan selesai dalam milidetik, bukan
+/// ~0,6 detik seperti memanggil PowerShell. Kalau itu gagal, hasilnya
+/// dikonfirmasi ulang dengan `Resolve-DnsName` sebelum DNS dinyatakan rusak:
+/// memulihkan DNS padahal hanya ada gangguan sesaat jauh lebih merugikan
+/// daripada satu pemeriksaan tambahan di jalur kegagalan.
 pub fn verify_resolution() -> Result<(), String> {
-    run_ps("$null = Resolve-DnsName example.com -Type A -ErrorAction Stop; 'ok'").map(|_| ())
+    if system_resolves("example.com") {
+        return Ok(());
+    }
+    run_ps("$null = Resolve-DnsName example.com -Type A -ErrorAction Stop; 'ok'")
+        .map(|_| ())
+        .map_err(|e| format!("getaddrinfo gagal, lalu {e}"))
+}
+
+/// Resolusi lewat tumpukan resolver Windows (termasuk DNS Client cache), tanpa
+/// proses tambahan. Port 443 hanya pilihan bebas; yang dipakai hanya alamatnya.
+fn system_resolves(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    (host, 443u16)
+        .to_socket_addrs()
+        .map(|mut addrs| addrs.next().is_some())
+        .unwrap_or(false)
 }
 
 /// Apakah pemulihan otomatis saat logon sudah terdaftar.

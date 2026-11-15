@@ -4,7 +4,7 @@
 //! menyimpan hasilnya sebentar di cache supaya pertanyaan berulang tidak
 //! perlu menyeberang jaringan lagi.
 
-use crate::engine::Engine;
+use crate::engine::{Engine, build_query, describe};
 use crate::log::Log;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
@@ -214,8 +214,10 @@ pub async fn probe() -> Result<String, String> {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("tidak bisa membuka socket probe: {e}"))?;
-    let query = crate::engine::build_query("example.com.");
-    let expect = [query[0], query[1]];
+    let query = build_query("example.com.");
+    let expect = *query
+        .first_chunk::<2>()
+        .ok_or_else(|| "query probe tidak terbentuk".to_string())?;
 
     socket
         .send_to(&query, ADDR_V4)
@@ -245,7 +247,7 @@ pub async fn probe() -> Result<String, String> {
     if msg.answers.is_empty() {
         return Err("resolver menjawab tanpa data".to_string());
     }
-    Ok(crate::engine::describe(response))
+    Ok(describe(response))
 }
 
 /// Socket yang sudah terikat, siap dijalankan.
@@ -394,7 +396,6 @@ async fn serve_tcp(mut stream: TcpStream, proxy: Arc<Proxy>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::build_query;
 
     /// Respons TXT berukuran 639 byte: lebih besar dari batas 512 byte yang
     /// dipakai klien tanpa EDNS, jadi jalur truncation benar-benar teruji.

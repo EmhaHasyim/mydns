@@ -16,11 +16,16 @@ impl Log {
         }
     }
 
+    /// Poison diabaikan: buffer hanya berisi teks, dan log tidak boleh ikut
+    /// membuat proses panik saat dibaca.
+    fn lines(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+        self.buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn push(&self, line: impl Into<String>) {
-        let mut buf = match self.buf.lock() {
-            Ok(b) => b,
-            Err(p) => p.into_inner(),
-        };
+        let mut buf = self.lines();
         buf.push_back(line.into());
         while buf.len() > MAX_LINES {
             buf.pop_front();
@@ -29,11 +34,7 @@ impl Log {
 
     /// Salinan baris terlama → terbaru, untuk panel log di TUI.
     pub fn snapshot(&self) -> Vec<String> {
-        let buf = match self.buf.lock() {
-            Ok(b) => b,
-            Err(p) => p.into_inner(),
-        };
-        buf.iter().cloned().collect()
+        self.lines().iter().cloned().collect()
     }
 }
 

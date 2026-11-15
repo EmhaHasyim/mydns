@@ -8,7 +8,7 @@ mod ui;
 mod win;
 
 use crate::log::Log;
-use crate::providers::{providers as resolver_list, read_config};
+use crate::providers::{config_path, providers as resolver_list, read_config};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -119,11 +119,7 @@ fn cmd_status() {
         Some(state) => {
             println!(
                 "\nCatatan MyDNS: provider = {}, {} adapter tercatat",
-                if state.provider.is_empty() {
-                    "-"
-                } else {
-                    &state.provider
-                },
+                provider_label(&state.provider),
                 state.ifaces.len()
             );
             println!("  state file: {}", win::state_path().display());
@@ -202,11 +198,7 @@ fn cmd_doctor() {
         Some(state) => {
             info(&format!(
                 "catatan MyDNS: provider {}, {} adapter",
-                if state.provider.is_empty() {
-                    "-"
-                } else {
-                    &state.provider
-                },
+                provider_label(&state.provider),
                 state.ifaces.len()
             ));
             if port_free {
@@ -257,7 +249,7 @@ fn cmd_doctor() {
         fail(&format!(
             "{} baris bermasalah di {}",
             config.errors.len(),
-            crate::providers::config_path().display()
+            config_path().display()
         ));
         problems += 1;
         for error in config.errors.iter().take(3) {
@@ -291,10 +283,7 @@ fn cmd_providers() {
     }
 
     let config = read_config();
-    println!(
-        "Berkas kustom: {}",
-        crate::providers::config_path().display()
-    );
+    println!("Berkas kustom: {}", config_path().display());
     if !config.errors.is_empty() {
         for error in &config.errors {
             println!("  masalah: {error}");
@@ -340,6 +329,11 @@ fn cmd_autostart(args: &[String], mode: &str) {
             std::process::exit(2);
         }
     }
+}
+
+/// Nama provider untuk ditampilkan; "-" kalau catatan lama tidak menyebutkannya.
+fn provider_label(id: &str) -> &str {
+    if id.is_empty() { "-" } else { id }
 }
 
 fn okay(text: &str) {
@@ -409,8 +403,9 @@ fn cmd_serve(provider_id: &str) {
         let bound = server::bind(engine, log).await?;
         let proxy = bound.proxy.clone();
         println!(
-            "Proxy {} (DoQ/DoH3) siap di {} dan {}",
+            "Proxy {} ({}) siap di {} dan {}",
             provider.name,
+            provider.badges(),
             server::ADDR_V4,
             server::ADDR_V6
         );

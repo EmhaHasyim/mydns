@@ -1,0 +1,5 @@
+# Satu aturan baris untuk semua checkout, di OS apa pun.
+* text=auto eol=lf
+
+# Skrip batch Windows wajib CRLF, kalau tidak `cmd.exe` salah membaca baris.
+*.cmd text eol=crlf
