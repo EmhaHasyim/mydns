@@ -129,11 +129,20 @@ di TUI yang mudah dipakai:
 | `mydns autostart off` | lepaskan pemulihan otomatis itu |
 | `mydns test` | uji DoQ / DoH3 / DoH2 ke semua provider + latensi |
 | `mydns serve adguard` | jalankan proxy saja (debug), tanpa mengubah DNS |
+| `mydns daemon [id]` | proxy tanpa TUI + kontrol lewat named pipe (tetap jalan saat TUI tertutup) |
+| `mydns control status` | tanya daemon: provider, uptime, cache, query diteruskan |
+| `mydns control restore` | minta daemon memulihkan DNS tanpa berhenti |
+| `mydns control stop` | hentikan daemon (DNS dipulihkan dulu) |
 | `mydns warp register` | daftarkan perangkat Cloudflare WARP (sekali saja) |
 | `mydns warp status` | tampilkan data perangkat WARP yang tersimpan |
 | `mydns warp test` | buka tunnel WARP dan uji satu query DNS |
 
 `mydns test` dan `mydns serve` **tidak** butuh admin dan tidak mengubah setelan DNS.
+
+`mydns daemon` berguna kalau proxy harus hidup tanpa terminal TUI: DNS tetap
+dialihkan, dan `mydns control ...` bisa dipanggil dari jendela lain. Perintah
+kontrol yang tidak dijalankan dengan hak admin tetap bisa memakai daemon; hanya
+pengalihan DNS-nya yang butuh admin (dan dilaporkan, bukan didiamkan).
 
 Peristiwa penting (apply, restore, registrasi WARP, kegagalan) ditulis ke
 `%LOCALAPPDATA%\MyDns\mydns.log` dan bisa dibaca dengan `mydns log`. Log tidak
@@ -371,9 +380,11 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
 - **Query identik yang datang bersamaan diteruskan sekali.** Sisanya menunggu
   lalu mengambil hasil dari cache, jadi lonjakan query yang sama tidak
   menggandakan trafik ke resolver.
-- **Belum ada mode Windows service**, jadi filter DNS belum bisa "set once,
-  jalan terus" tanpa terminal terbuka; yang dijamin hanya pemulihan otomatis,
-  bukan proxy yang hidup terus.
+- **`mydns daemon` belum didaftarkan sebagai Windows service (SCM).** Prosesnya
+  sudah bisa hidup tanpa TUI dan dikendalikan lewat `mydns control`, tetapi
+  instalasi service butuh hak administrator dan belum diuji di mesin tanpa
+  admin, jadi belum disediakan. Tanpa admin, daemon tetap melayani proxy namun
+  DNS adapter tidak diubah.
 
 ## Struktur
 
@@ -384,6 +395,7 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
 | `src/engine.rs` | klien DoQ (quinn), DoH3 (h3), DoH2 (h2), rantai fallback |
 | `src/warp.rs` | registrasi WARP, mTLS + pinning SPKI, tunnel CONNECT-IP, paket IPv4/UDP |
 | `src/server.rs` | listener UDP/TCP di loopback, cache TTL, truncation |
+| `src/daemon.rs` | mode tanpa TUI, named pipe `\\.\pipe\mydns-daemon`, status/restore/stop |
 | `src/ui.rs` | TUI ratatui + alur terapkan/pulihkan |
 | `src/win.rs` | deteksi adapter, `Set-DnsClientServerAddress`, state file, watchdog, autostart |
 | `src/log.rs` | buffer log internal, log berkas, timestamp UTC |

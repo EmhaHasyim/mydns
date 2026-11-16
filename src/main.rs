@@ -1,5 +1,6 @@
 //! MyDNS — pengalih DNS Windows 11 ke DoQ / DoH3 (QUIC) lewat proxy loopback.
 
+mod daemon;
 mod engine;
 mod log;
 mod providers;
@@ -58,6 +59,13 @@ fn main() {
             positional.get(1).map(|s| s.as_str()).unwrap_or("status"),
         ),
         "serve" => cmd_serve(positional.get(1).map(|s| s.as_str()).unwrap_or("adguard")),
+        "daemon" => cmd_daemon(
+            positional
+                .get(1)
+                .map(|s| s.as_str())
+                .unwrap_or("cloudflare"),
+        ),
+        "control" => cmd_control(positional.get(1).map(|s| s.as_str()).unwrap_or("status")),
         "warp" => cmd_warp(positional.get(1).map(|s| s.as_str()).unwrap_or("status")),
         other => {
             eprintln!("perintah tidak dikenal: {other}\n");
@@ -538,6 +546,23 @@ fn cmd_serve(provider_id: &str) {
     }
 }
 
+fn cmd_daemon(provider_id: &str) {
+    if let Err(e) = daemon::run(provider_id) {
+        eprintln!("gagal: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn cmd_control(command: &str) {
+    match daemon::control(command) {
+        Ok(reply) => println!("{reply}"),
+        Err(e) => {
+            eprintln!("gagal: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn help() {
     println!(
         "MyDNS — DNS over QUIC / HTTP-3 untuk Windows 11
@@ -553,6 +578,8 @@ PEMAKAIAN
   mydns providers       daftar resolver aktif + berkas kustom yang dibaca
   mydns test            uji DoQ, DoH3, DoH2 ke semua provider + latensi
   mydns serve <id>      jalankan proxy saja tanpa TUI (untuk debug)
+  mydns daemon [id]     proxy tanpa TUI + kontrol lewat named pipe
+  mydns control <cmd>   status / restore / stop untuk daemon yang berjalan
   mydns warp register   daftarkan perangkat Cloudflare WARP (mode MASQUE)
   mydns warp status     tampilkan data perangkat WARP yang tersimpan
   mydns warp test       buka tunnel WARP dan uji satu query DNS
@@ -568,7 +595,8 @@ CATATAN
   • Kalau prosesnya dibunuh atau mesin mati mendadak, pendamping kecil yang
     dijalankan TUI akan memulihkan DNS; `mydns autostart on` menutup kasus
     reboot dengan menjalankan pemulihan saat logon.
-  • Perubahan adapter butuh hak administrator (prompt UAC).
+  • Perubahan adapter butuh hak administrator (prompt UAC). Daemon tetap
+    bisa melayani proxy tanpa admin; DNS-nya saja yang tidak diubah.
   • Kalau port 53 sudah dipakai proses lain (Docker, AdGuard Home, VPN),
     aplikasi menolak mengubah DNS dan menampilkan error.
   • DNS baru dianggap berhasil setelah resolver sistem benar-benar menjawab;
