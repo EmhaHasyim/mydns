@@ -39,6 +39,26 @@ pub struct Saved {
     pub provider: String,
     pub saved_at: u64,
     pub ifaces: BTreeMap<String, SavedIface>,
+    /// Rute dan adapter tunnel yang sedang dipasang. Ikut disimpan supaya
+    /// setelah crash/reboot internet bisa dipulihkan tanpa menebak-nebak.
+    #[serde(default)]
+    pub vpn: Option<SavedVpn>,
+}
+
+/// Satu rute yang dipasang mode VPN penuh.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SavedRoute {
+    pub dest: String,
+    pub iface: u32,
+    pub nexthop: String,
+}
+
+/// Keadaan tunnel VPN yang perlu dicabut kembali.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct SavedVpn {
+    pub adapter: String,
+    pub endpoint: String,
+    pub routes: Vec<SavedRoute>,
 }
 
 pub fn state_path() -> PathBuf {
@@ -65,7 +85,7 @@ pub fn clear_state() {
     let _ = std::fs::remove_file(state_path());
 }
 
-fn run_ps(script: &str) -> Result<String, String> {
+pub(crate) fn run_ps(script: &str) -> Result<String, String> {
     // Paksa UTF-8 supaya nama adapter non-ASCII tidak muncul sebagai mojibake.
     let full = format!("$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8\n{script}");
     let out = Command::new("powershell")
@@ -515,6 +535,143 @@ pub fn restore_if_stale() -> Result<Option<String>, String> {
     restore().map(Some)
 }
 
+// ── rute VPN (full tunnel) ──────────────────────────────────────────────
+
+/// Gateway IPv4 default yang sedang dipakai, dipakai untuk membuat host route
+/// ke endpoint WARP supaya koneksi QUIC tidak masuk ke tunnel sendiri.
+pub fn default_route() -> Result<(u32, String), String> {
+    let raw = run_ps(
+        r#"$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -ne '0.0.0.0' } | Sort-Object RouteMetric | Select-Object -First 1
+if ($r) { [pscustomobject]@{ iface = "$($r.ifIndex)"; hop = "$($r.NextHop)" } | ConvertTo-Json -Compress } else { '{}' }"#,
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("gateway default tidak terbaca: {e}"))?;
+    let iface = value
+        .get("iface")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| "tidak ada gateway IPv4 default yang aktif".to_string())?;
+    let hop = value
+        .get("hop")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((iface, hop))
+}
+
+/// Rute yang membentuk full tunnel, dipisah dari eksekusi supaya isinya bisa
+/// diuji tanpa menyentuh tabel rute Windows.
+///
+/// Endpoint WARP **harus** punya host route lewat gateway asli: tanpa itu paket
+/// QUIC ke endpoint ikut masuk tunnel dan seluruh koneksi berputar di tempat.
+pub fn vpn_route_plan(
+    index: u32,
+    endpoint: Option<&str>,
+    physical: Option<(u32, String)>,
+) -> Result<Vec<SavedRoute>, String> {
+    let mut routes = Vec::new();
+    if let Some(ip) = endpoint.map(str::trim).filter(|ip| !ip.is_empty()) {
+        let (phys_index, hop) =
+            physical.ok_or_else(|| "tidak ada gateway IPv4 default yang aktif".to_string())?;
+        routes.push(SavedRoute {
+            dest: format!("{ip}/32"),
+            iface: phys_index,
+            nexthop: hop,
+        });
+    }
+    for dest in ["0.0.0.0/1", "128.0.0.0/1"] {
+        routes.push(SavedRoute {
+            dest: dest.to_string(),
+            iface: index,
+            nexthop: "0.0.0.0".to_string(),
+        });
+    }
+    Ok(routes)
+}
+
+fn ps_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Pasang rute full tunnel: dua rute `/1` lebih spesifik dari default route,
+/// ditambah host route ke endpoint WARP lewat gateway asli.
+///
+/// Rencananya disimpan **sebelum** rute dipasang, jadi kalau proses mati di
+/// tengah jalan masih jelas rute mana yang harus dicabut.
+pub fn vpn_install_routes(
+    adapter: &str,
+    index: u32,
+    endpoint: Option<&str>,
+) -> Result<SavedVpn, String> {
+    require_admin()?;
+    // Gateway asli hanya dibutuhkan kalau ada endpoint yang harus dikeluarkan
+    // dari tunnel.
+    let physical = if endpoint.is_some_and(|ip| !ip.trim().is_empty()) {
+        Some(default_route()?)
+    } else {
+        None
+    };
+    let routes = vpn_route_plan(index, endpoint, physical)?;
+
+    let saved = SavedVpn {
+        adapter: adapter.to_string(),
+        endpoint: endpoint.unwrap_or("").to_string(),
+        routes: routes.clone(),
+    };
+    let mut state = load_state().unwrap_or_default();
+    state.vpn = Some(saved.clone());
+    save_state(&state)?;
+
+    let mut script = String::from("$ErrorActionPreference='Stop'\n");
+    for route in &routes {
+        script.push_str(&format!(
+            "New-NetRoute -DestinationPrefix {} -InterfaceIndex {} -NextHop {} -RouteMetric 1 | Out-Null\n",
+            ps_quote(&route.dest),
+            route.iface,
+            ps_quote(&route.nexthop)
+        ));
+    }
+    script.push_str("'ok'\n");
+
+    if let Err(e) = run_ps(&script) {
+        vpn_remove_routes(&saved);
+        vpn_clear_state();
+        return Err(format!("gagal memasang rute VPN: {e}"));
+    }
+    Ok(saved)
+}
+
+/// Cabut rute yang pernah dipasang. Kegagalan diabaikan: yang penting sisa
+/// rute dicoba dibersihkan semua, bukan berhenti di rute pertama yang hilang.
+pub fn vpn_remove_routes(saved: &SavedVpn) {
+    let mut script = String::new();
+    for route in &saved.routes {
+        script.push_str(&format!(
+            "Remove-NetRoute -DestinationPrefix {} -InterfaceIndex {} -Confirm:$false -ErrorAction SilentlyContinue\n",
+            ps_quote(&route.dest),
+            route.iface
+        ));
+    }
+    let _ = run_ps(&script);
+}
+
+pub fn vpn_saved() -> Option<SavedVpn> {
+    load_state().and_then(|state| state.vpn)
+}
+
+/// Hapus catatan VPN tanpa menyentuh catatan DNS: Clear DNS masih memerlukannya.
+pub fn vpn_clear_state() {
+    let Some(mut state) = load_state() else {
+        return;
+    };
+    state.vpn = None;
+    if state.ifaces.is_empty() && state.provider.is_empty() {
+        clear_state();
+    } else {
+        let _ = save_state(&state);
+    }
+}
+
 /// Tunggu proses lain benar-benar selesai. `false` kalau prosesnya sudah tidak
 /// ada saat hendak dibuka.
 pub fn wait_for_process(pid: u32) -> bool {
@@ -685,7 +842,7 @@ pub fn summary() -> String {
 
 /// Tanpa hak admin, perintah PowerShell akan gagal diam-diam; lebih baik
 /// menolak terang-terangan daripada melaporkan "berhasil" palsu.
-fn require_admin() -> Result<(), String> {
+pub(crate) fn require_admin() -> Result<(), String> {
     if is_elevated() {
         Ok(())
     } else {
@@ -794,6 +951,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rencana_rute_vpn_mengeluarkan_endpoint_dari_tunnel() {
+        let routes = vpn_route_plan(
+            49,
+            Some("162.159.198.2"),
+            Some((18, "192.168.1.1".to_string())),
+        )
+        .unwrap();
+        assert_eq!(routes.len(), 3);
+        assert_eq!(
+            routes[0],
+            SavedRoute {
+                dest: "162.159.198.2/32".to_string(),
+                iface: 18,
+                nexthop: "192.168.1.1".to_string(),
+            }
+        );
+        assert_eq!(routes[1].dest, "0.0.0.0/1");
+        assert_eq!(routes[1].iface, 49);
+        assert_eq!(routes[2].dest, "128.0.0.0/1");
+        assert!(routes[1..].iter().all(|route| route.iface == 49));
+    }
+
+    #[test]
+    fn rencana_rute_vpn_tanpa_endpoint() {
+        let routes = vpn_route_plan(7, None, None).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route.iface == 7));
+    }
+
+    #[test]
+    fn rencana_rute_vpn_butuh_gateway_untuk_endpoint() {
+        // Tanpa gateway asli, host route ke endpoint tidak bisa dipasang —
+        // dan full tunnel tanpa itu akan memutar koneksi QUIC ke dirinya sendiri.
+        assert!(vpn_route_plan(7, Some("162.159.198.2"), None).is_err());
+    }
+
     fn saved(index: &str, name: &str, v4: &[&str]) -> Saved {
         let mut ifaces = BTreeMap::new();
         ifaces.insert(
@@ -808,6 +1002,7 @@ mod tests {
             provider: "quad9".to_string(),
             saved_at: 0,
             ifaces,
+            vpn: None,
         }
     }
 

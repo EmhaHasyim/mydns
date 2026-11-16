@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 const API_HOST: &str = "api.cloudflareclient.com";
 const API_VERSION: &str = "v0a4471";
@@ -895,6 +895,9 @@ pub struct Tunnel {
     src: Ipv4Addr,
     pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
     next_port: AtomicU16,
+    /// Penerima paket IP mentah, dipakai mode VPN penuh. Tanpa penerima,
+    /// paket selain jawaban DNS dibuang seperti sebelumnya.
+    raw: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl Tunnel {
@@ -911,8 +914,9 @@ impl Tunnel {
                 Ok((endpoint, conn, h3, quarter)) => {
                     let pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>> =
                         Arc::new(Mutex::new(HashMap::new()));
+                    let raw = Arc::new(std::sync::Mutex::new(None));
 
-                    spawn_reader(conn.clone(), Arc::clone(&pending));
+                    spawn_reader(conn.clone(), Arc::clone(&pending), Arc::clone(&raw));
 
                     return Ok(Arc::new(Self {
                         _endpoint: endpoint,
@@ -922,6 +926,7 @@ impl Tunnel {
                         src,
                         pending,
                         next_port: AtomicU16::new(40_000),
+                        raw,
                     }));
                 }
                 Err(e) => errors.push(format!("{addr}: {e}")),
@@ -1036,6 +1041,39 @@ impl Tunnel {
                 return port;
             }
         }
+    }
+
+    /// Ukuran datagram terbesar yang diterima QUIC. MTU adapter TUN harus lebih
+    /// kecil dari ini setelah dikurangi awalan quarter-stream-id + context id.
+    pub fn max_datagram(&self) -> usize {
+        self.conn.max_datagram_size().unwrap_or(TUNNEL_MTU)
+    }
+
+    /// Alamat IP endpoint WARP (tanpa port), dipakai untuk host route supaya
+    /// koneksi QUIC-nya tidak masuk ke tunnel sendiri.
+    pub fn endpoint_ip(&self) -> Option<IpAddr> {
+        Some(self.conn.remote_address().ip())
+    }
+
+    /// Paket IP mentah yang datang dari WARP dikirim ke sini (mode VPN penuh).
+    pub fn set_raw_sink(&self, sink: mpsc::UnboundedSender<Vec<u8>>) {
+        if let Ok(mut slot) = self.raw.lock() {
+            *slot = Some(sink);
+        }
+    }
+
+    /// Bungkus satu paket IP utuh sebagai HTTP Datagram CONNECT-IP.
+    pub fn send_ip(&self, packet: &[u8]) -> Result<(), String> {
+        if packet.len() + 8 > self.max_datagram() {
+            return Err("paket lebih besar dari MTU tunnel".to_string());
+        }
+        let mut datagram = Vec::with_capacity(packet.len() + 8);
+        put_varint(&mut datagram, self.quarter);
+        put_varint(&mut datagram, 0); // context id CONNECT-IP
+        datagram.extend_from_slice(packet);
+        self.conn
+            .send_datagram(Bytes::from(datagram))
+            .map_err(|e| format!("kirim datagram: {e}"))
     }
 }
 
@@ -1284,10 +1322,12 @@ fn static_status(index: u64) -> Option<u16> {
     }
 }
 
-/// Baca datagram masuk dan teruskan payload DNS ke penunggunya.
+/// Baca datagram masuk: jawaban DNS diberikan ke penunggunya, paket lain
+/// (mode VPN penuh) diteruskan ke adapter TUN lewat `raw`.
 fn spawn_reader(
     conn: quinn::Connection,
     pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
+    raw: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1301,10 +1341,19 @@ fn spawn_reader(
             let Some((_, packet)) = get_varint(rest) else {
                 continue;
             };
-            if let Some((port, dns)) = udp_to_port(packet, 53) {
-                if let Some(tx) = pending.lock().await.remove(&port) {
-                    let _ = tx.send(dns.to_vec());
-                }
+            if let Some((port, dns)) = udp_to_port(packet, 53)
+                && let Some(tx) = pending.lock().await.remove(&port)
+            {
+                let _ = tx.send(dns.to_vec());
+                continue;
+            }
+            // Hanya paket IPv4 yang bisa ditulis ke adapter TUN kita.
+            if packet.len() >= 20
+                && packet[0] >> 4 == 4
+                && let Ok(slot) = raw.lock()
+                && let Some(sink) = slot.as_ref()
+            {
+                let _ = sink.send(packet.to_vec());
             }
         }
     });
