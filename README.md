@@ -67,7 +67,8 @@ UAC sendiri. Tombol:
 |---|---|
 | `↑` `↓` / `j` `k` | pindah pilihan |
 | `1` – `9` | lompat ke baris |
-| `Enter` | terapkan resolver yang dipilih |
+| `Enter` | terapkan resolver yang dipilih (DNS saja) |
+| `v` | nyalakan/matikan VPN — seluruh trafik lewat WARP |
 | `c` | Clear DNS (pulihkan, tetap di TUI) |
 | `l` | log query terakhir (jalur + latensi) |
 | `?` | bantuan |
@@ -133,9 +134,13 @@ di TUI yang mudah dipakai:
 | `mydns control status` | tanya daemon: provider, uptime, cache, query diteruskan |
 | `mydns control restore` | minta daemon memulihkan DNS tanpa berhenti |
 | `mydns control stop` | hentikan daemon (DNS dipulihkan dulu) |
-| `mydns warp register` | daftarkan perangkat Cloudflare WARP (sekali saja) |
+| `mydns warp register` | buat ulang perangkat WARP (normalnya otomatis) |
 | `mydns warp status` | tampilkan data perangkat WARP yang tersimpan |
 | `mydns warp test` | buka tunnel WARP dan uji satu query DNS |
+| `mydns vpn on` | nyalakan VPN penuh, berjalan di depan sampai `Ctrl+C` |
+| `mydns vpn off` | matikan VPN dan cabut rutenya |
+| `mydns vpn status` | keadaan tunnel VPN yang tercatat di state file |
+| `mydns vpn test` | buka tunnel, buktikan trafik lewat, lalu tutup lagi |
 
 `mydns test` dan `mydns serve` **tidak** butuh admin dan tidak mengubah setelan DNS.
 
@@ -253,16 +258,16 @@ Resolver kelima: query DNS dikirim **di dalam tunnel MASQUE Cloudflare WARP**
 hanya query DNS — tidak ada adapter TUN dan tidak ada route yang diubah, jadi
 sisa trafik tetap memakai koneksi biasa.
 
-Sekali saja, daftarkan perangkat:
+**Tidak ada langkah pendaftaran yang perlu diketahui.** Pilih baris
+**WARP (MASQUE)** di TUI seperti resolver lain; saat pertama kali dipakai,
+MyDNS mendaftarkan perangkat sendiri ke API Cloudflare (buat perangkat
+WireGuard, lalu tukar kuncinya ke kunci P-256 untuk mode MASQUE) dan menyimpan
+hasilnya di `%APPDATA%\MyDns\warp.json`. Pilihan itu sekaligus menjadi saklar
+"pakai VPN WARP atau tidak": resolver lain berjalan tanpa WARP.
 
-```powershell
-mydns warp register
-```
-
-Perintah itu memanggil API Cloudflare (buat perangkat WireGuard, lalu tukar
-kuncinya ke kunci P-256 untuk mode MASQUE) dan menyimpan hasilnya di
-`%APPDATA%\MyDns\warp.json`. Sesudah itu baris **WARP (MASQUE)** di TUI bisa
-dipilih seperti resolver lain.
+Pendaftaran otomatis hanya terjadi sekali. Kalau berkasnya rusak, MyDNS
+melaporkan errornya dan tidak menimpa perangkat lama diam-diam; `mydns warp
+register` tetap ada untuk membuat perangkat baru dari awal.
 
 Periksa dan uji kapan saja:
 
@@ -292,7 +297,7 @@ Yang perlu diketahui:
 - `warp.json` berisi kunci privat perangkat, tetapi disimpan **terenkripsi
   DPAPI** sehingga hanya user Windows yang sama di mesin ini yang bisa
   membukanya. Berkas lama berisi base64 biasa tetap dibaca, lalu dienkripsi saat
-  disimpan lagi. `mydns warp register` ulang akan membuat perangkat baru.
+  disimpan lagi.
 
 ## Tes
 
@@ -352,6 +357,60 @@ Yang dihitung hanya adapter berstatus **Up** dan punya gateway. Adapter yang
 sedang Disconnected (mis. Wi-Fi saat memakai kabel) sengaja tidak disentuh,
 supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
 
+## Mode VPN: satu pilihan, dua keadaan
+
+Seluruh permintaan aplikasi ini sebenarnya hanya satu pertanyaan: **dengan VPN
+atau tidak**. Di TUI, tombol `v` menjawabnya.
+
+- **Tidak** (`Enter` pada resolver) — DNS saja. Query DNS masuk ke proxy lokal
+  lalu keluar lewat DoQ/DoH3/WARP-DNS; trafik lain tetap lewat jalur biasa.
+- **Ya** (`v`) — VPN + DNS. MyDNS membuat adapter TUN, memasang dua rute `/1`
+  (lebih spesifik dari default route, jadi bisa dicabut bersih), dan membawa
+  **seluruh trafik IPv4** lewat tunnel WARP MASQUE yang sama dengan jalur DNS.
+
+Tidak ada userspace TCP/IP stack: paket IP dari adapter Wintun diteruskan apa
+adanya sebagai HTTP Datagram CONNECT-IP, dan paket balik ditulis kembali ke
+adapter. WARP yang menyalurkan ke internet, TCP state tetap di ujung.
+
+Rute yang dipasang:
+
+```
+0.0.0.0/1      → adapter MyDNS     (menang atas default route)
+128.0.0.0/1    → adapter MyDNS
+<endpoint>/32  → gateway asli     (supaya koneksi QUIC tidak masuk tunnel sendiri)
+```
+
+Host route ke endpoint itu wajib: tanpa itu paket QUIC ke endpoint WARP ikut
+masuk tunnel dan seluruh koneksi berputar di tempat.
+
+### Perangkat otomatis, satu per user
+
+Memilih VPN tidak pernah meminta pendaftaran manual. Saat pertama dipakai,
+MyDNS mendaftarkan perangkat WARP baru (`api.cloudflareclient.com`) dan menyimpan
+hasilnya di `%APPDATA%\MyDns\warp.json`:
+
+- setiap pendaftaran membuat pasangan kunci baru, jadi **setiap user Windows di
+  mesin ini punya perangkat WARP yang berbeda**;
+- kunci privat P-256 disimpan terenkripsi **DPAPI**, sehingga berkas itu tidak
+  bisa dipakai di mesin atau akun lain;
+- tidak ada akun, email, atau API key yang perlu diisi.
+
+### Wintun
+
+Mode VPN butuh `wintun.dll` (driver TUN resmi WireGuard, lisensi mengizinkan
+redistribusi). Salinan 0.14.1 (amd64) ada di `assets/wintun.dll` beserta
+`assets/wintun-LICENSE.txt`. MyDNS mencarinya berurutan: di samping `mydns.exe`,
+lalu `assets/wintun.dll` di folder yang sama, lalu folder `assets` proyek saat
+dijalankan lewat `cargo run`.
+
+### Kalau VPN gagal
+
+Penerapan bersifat transaksional seperti jalur DNS. Setelah rute dipasang,
+MyDNS membuka satu koneksi TCP ke alamat publik; kalau itu gagal, rute langsung
+dicabut dan adapter dihapus, lalu alasannya dilaporkan. Rencana rute disimpan di
+state file **sebelum** dipasang, jadi watchdog, `mydns restore`, dan pemulihan
+saat logon tetap bisa mencabutnya setelah crash atau reboot.
+
 ## Batasan yang perlu diketahui
 
 - **DNS hanya aktif selama aplikasi berjalan.** Kalau terminal ditutup, Windows
@@ -380,6 +439,14 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
 - **Query identik yang datang bersamaan diteruskan sekali.** Sisanya menunggu
   lalu mengambil hasil dari cache, jadi lonjakan query yang sama tidak
   menggandakan trafik ke resolver.
+- **VPN penuh hanya untuk IPv4.** Rute `::/1` dan `8000::/1` belum dipasang, jadi
+  trafik IPv6 tetap keluar lewat jalur asli saat VPN menyala. Ini batasan yang
+  disengaja untuk sekarang: rute IPv6 ke adapter Wintun butuh alamat link-local
+  dan next-hop yang berbeda, dan kesalahan di sana memutus konektivitas lebih
+  luas. DNS AAAA tetap dijawab lewat tunnel.
+- **VPN butuh `wintun.dll` dan hak admin.** Membuat adapter TUN tidak bisa
+  dilakukan tanpa elevasi, dan DLL-nya harus ikut didistribusikan bersama
+  `mydns.exe` (lihat bagian mode VPN).
 - **`mydns daemon` belum didaftarkan sebagai Windows service (SCM).** Prosesnya
   sudah bisa hidup tanpa TUI dan dikendalikan lewat `mydns control`, tetapi
   instalasi service butuh hak administrator dan belum diuji di mesin tanpa
@@ -397,5 +464,6 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
 | `src/server.rs` | listener UDP/TCP di loopback, cache TTL, truncation |
 | `src/daemon.rs` | mode tanpa TUI, named pipe `\\.\pipe\mydns-daemon`, status/restore/stop |
 | `src/ui.rs` | TUI ratatui + alur terapkan/pulihkan |
-| `src/win.rs` | deteksi adapter, `Set-DnsClientServerAddress`, state file, watchdog, autostart |
+| `src/vpn.rs` | mode VPN penuh: adapter Wintun, pompa paket ke tunnel, rollback rute |
+| `src/win.rs` | deteksi adapter, `Set-DnsClientServerAddress`, state file, watchdog, autostart, rute VPN |
 | `src/log.rs` | buffer log internal, log berkas, timestamp UTC |

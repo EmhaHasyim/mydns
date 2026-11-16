@@ -45,10 +45,11 @@ const DETAIL_WIDTH: u16 = 36;
 const HELP_WIDTH: u16 = 58;
 const HELP_HEIGHT: u16 = 12;
 
-const HELP_KEYS: [(&str, &str); 7] = [
+const HELP_KEYS: [(&str, &str); 8] = [
     ("↑ ↓ / j k", "pindah pilihan"),
     ("1 – 9", "lompat ke baris"),
-    ("enter", "terapkan resolver"),
+    ("enter", "terapkan resolver (DNS saja)"),
+    ("v", "VPN: seluruh trafik lewat WARP"),
     ("c", "Clear DNS (pulihkan)"),
     ("l", "log query terakhir"),
     ("?", "tutup bantuan ini"),
@@ -111,6 +112,8 @@ pub struct Session {
     proxy_task: JoinHandle<()>,
     stats_task: JoinHandle<()>,
     drift_task: JoinHandle<()>,
+    /// Ada isinya kalau sesi ini berjalan sebagai VPN penuh.
+    vpn: Option<crate::vpn::Vpn>,
 }
 
 struct Active {
@@ -136,6 +139,8 @@ pub struct App {
     hits: u64,
     misses: u64,
     tick: u64,
+    /// Pilihan biner yang diminta pengguna: dengan VPN, atau DNS saja.
+    vpn: bool,
     /// Latensi beberapa query terakhir per provider (maks 20), untuk p50 di
     /// panel detail.
     latencies: Vec<Vec<u128>>,
@@ -186,6 +191,7 @@ impl App {
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = item_count() - 1,
             KeyCode::Enter => self.activate(),
+            KeyCode::Char('v') => self.toggle_vpn(),
             KeyCode::Char('c') => self.clear_dns(),
             KeyCode::Char(d @ '1'..='9') => {
                 // Angka 1–9 langsung menuju baris, tanpa menerapkan apa pun.
@@ -228,8 +234,39 @@ impl App {
         let tx = self.tx.clone();
         let session = self.session.clone();
         let log = self.log.clone();
+        // Saat VPN menyala, resolver yang dipakai adalah WARP: seluruh query
+        // ikut tunnel, tidak ada jalur DNS yang keluar sendiri.
+        let vpn = self.vpn;
         rt.spawn(async move {
-            apply_flow(index, session, log, tx).await;
+            apply_flow(index, vpn, session, log, tx).await;
+        });
+    }
+
+    /// Satu tombol untuk pilihan biner: dengan VPN, atau DNS saja.
+    fn toggle_vpn(&mut self) {
+        if self.vpn {
+            self.vpn = false;
+            self.clear_dns();
+            self.status = "VPN dimatikan · tekan enter untuk DNS saja".to_string();
+            return;
+        }
+
+        let Some(index) = providers().iter().position(|p| p.id == "warp") else {
+            self.is_error = true;
+            self.status = "resolver WARP tidak tersedia".to_string();
+            return;
+        };
+        if !self.begin("menyalakan VPN — seluruh trafik lewat WARP…".to_string()) {
+            return;
+        }
+        self.vpn = true;
+
+        let rt = self.rt.clone();
+        let tx = self.tx.clone();
+        let session = self.session.clone();
+        let log = self.log.clone();
+        rt.spawn(async move {
+            apply_flow(index, true, session, log, tx).await;
         });
     }
 
@@ -243,6 +280,9 @@ impl App {
         let session = self.session.clone();
         rt.spawn(async move {
             stop_session(&session).await;
+            // Sisa rute dari sesi yang tidak sempat membersihkan diri juga
+            // dicabut, supaya "Clear DNS" benar-benar mengembalikan semuanya.
+            let _ = tokio::task::spawn_blocking(crate::vpn::down_persisted).await;
             let outcome = tokio::task::spawn_blocking(win::restore).await;
             let message = match outcome {
                 Ok(Ok(msg)) => Msg::Cleared(msg),
@@ -298,6 +338,9 @@ impl App {
                 self.idle();
                 self.is_error = true;
                 self.active = None;
+                // Gagal berarti tidak ada tunnel yang tersisa: jangan biarkan
+                // header mengaku VPN menyala.
+                self.vpn = false;
                 crate::log::event(&format!("gagal: {error}"));
                 self.status = error;
             }
@@ -517,10 +560,7 @@ impl App {
                     lines.push(text(config.device_id.clone(), fg(TEXT)));
                     lines.push(text(config.endpoint_v4, fg(MUTED)));
                 }
-                Err(_) => lines.push(text(
-                    "belum terdaftar — jalankan `mydns warp register`",
-                    fg(WARN),
-                )),
+                Err(_) => lines.push(text("didaftarkan otomatis saat WARP dipakai", fg(MUTED))),
             }
             if let Some(active) = self.active.as_ref().filter(|a| a.index == self.cursor) {
                 lines.push(Line::default());
@@ -750,15 +790,28 @@ async fn abort(
 async fn stop_session(session: &Arc<Mutex<Option<Session>>>) {
     let taken = { session.lock().await.take() };
     if let Some(session) = taken {
-        let _ = session.stop.send(true);
-        let _ = session.proxy_task.await;
-        let _ = session.stats_task.await;
-        let _ = session.drift_task.await;
+        let Session {
+            stop,
+            proxy_task,
+            stats_task,
+            drift_task,
+            vpn,
+        } = session;
+        let _ = stop.send(true);
+        let _ = proxy_task.await;
+        let _ = stats_task.await;
+        let _ = drift_task.await;
+        // Proxy berhenti dulu, baru tunnel: pengguna tidak pernah kehilangan
+        // resolver selama rute masih dialihkan.
+        if let Some(vpn) = vpn {
+            let _ = vpn.down().await;
+        }
     }
 }
 
 async fn apply_flow(
     index: usize,
+    vpn_mode: bool,
     session: Arc<Mutex<Option<Session>>>,
     log: Arc<Log>,
     tx: UnboundedSender<Msg>,
@@ -828,16 +881,40 @@ async fn apply_flow(
         return;
     }
 
+    // 3b. Mode VPN: seluruh trafik dialihkan lewat tunnel WARP. Rute dipasang
+    //     sebelum DNS disentuh, dan `Vpn::up` mencabutnya sendiri kalau tunnel
+    //     ternyata tidak meneruskan trafik.
+    let mut vpn = if vpn_mode {
+        let _ = tx.send(Msg::Working(
+            "membuka tunnel WARP untuk seluruh trafik…".to_string(),
+        ));
+        match crate::vpn::Vpn::up().await {
+            Ok(tunnel) => Some(tunnel),
+            Err(e) => {
+                abort(stop_tx, proxy_task, tx, e).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // 4. Baru arahkan adapter ke loopback.
     let id = provider.id;
     let applied = tokio::task::spawn_blocking(move || win::apply(id, listen_v6)).await;
     let adapters = match applied {
         Ok(Ok(adapters)) => adapters,
         Ok(Err(e)) => {
+            if let Some(vpn) = vpn.take() {
+                let _ = vpn.down().await;
+            }
             abort(stop_tx, proxy_task, tx, e).await;
             return;
         }
         Err(e) => {
+            if let Some(vpn) = vpn.take() {
+                let _ = vpn.down().await;
+            }
             abort(
                 stop_tx,
                 proxy_task,
@@ -858,6 +935,9 @@ async fn apply_flow(
         Err(e) => Err(format!("tugas verifikasi gagal: {e}")),
     };
     if let Err(e) = verdict {
+        if let Some(vpn) = vpn.take() {
+            let _ = vpn.down().await;
+        }
         let _ = tokio::task::spawn_blocking(win::restore).await;
         abort(
             stop_tx,
@@ -939,6 +1019,7 @@ async fn apply_flow(
         proxy_task,
         stats_task,
         drift_task,
+        vpn: vpn.take(),
     });
 
     let _ = tx.send(Msg::Working(format!(
@@ -975,6 +1056,7 @@ pub fn run(
         hits: 0,
         misses: 0,
         tick: 0,
+        vpn: false,
         latencies: vec![Vec::new(); providers().len()],
     };
 
@@ -1033,6 +1115,8 @@ pub fn run(
     let session_for_cleanup = session.clone();
     app.rt.block_on(async move {
         stop_session(&session_for_cleanup).await;
+        // Sisa rute dari sesi lama (mis. setelah crash) juga dicabut di sini.
+        let _ = tokio::task::spawn_blocking(crate::vpn::down_persisted).await;
         if win::load_state().is_some() {
             let _ = tokio::task::spawn_blocking(win::restore).await;
         }

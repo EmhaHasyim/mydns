@@ -6,6 +6,7 @@ mod log;
 mod providers;
 mod server;
 mod ui;
+mod vpn;
 mod warp;
 mod win;
 
@@ -67,6 +68,10 @@ fn main() {
         ),
         "control" => cmd_control(positional.get(1).map(|s| s.as_str()).unwrap_or("status")),
         "warp" => cmd_warp(positional.get(1).map(|s| s.as_str()).unwrap_or("status")),
+        "vpn" => cmd_vpn(
+            &args,
+            positional.get(1).map(|s| s.as_str()).unwrap_or("status"),
+        ),
         other => {
             eprintln!("perintah tidak dikenal: {other}\n");
             help();
@@ -152,8 +157,12 @@ fn cmd_restore(args: &[String]) {
     let rt = runtime();
     let result = rt.block_on(async {
         if stale_only {
+            let _ = tokio::task::spawn_blocking(vpn::down_if_stale).await;
             tokio::task::spawn_blocking(win::restore_if_stale).await
         } else {
+            // Rute VPN dicabut dulu: internet kembali lewat jalur asli sebelum
+            // DNS dipulihkan, jadi tidak ada jendela tanpa koneksi.
+            let _ = tokio::task::spawn_blocking(vpn::down_persisted).await;
             tokio::task::spawn_blocking(win::restore)
                 .await
                 .map(|r| r.map(Some))
@@ -179,6 +188,8 @@ fn cmd_watchdog(pid: u32) {
     if !win::wait_for_process(pid) {
         return;
     }
+    // Urutan sama dengan pemulihan manual: rute VPN dulu, baru DNS.
+    let _ = vpn::down_if_stale();
     let _ = win::restore_if_stale();
 }
 
@@ -213,6 +224,8 @@ fn cmd_doctor() {
         Ok(detail) => okay(&format!("proxy lokal menjawab — {detail}")),
         Err(_) => info("proxy lokal tidak berjalan"),
     }
+
+    info(&format!("VPN: {}", vpn::status()));
 
     let points_to_us = dns.contains("127.0.0.1");
     match win::load_state() {
@@ -439,7 +452,8 @@ fn cmd_warp(mode: &str) {
                     println!("  tunnel IP : {}", config.ipv4);
                     println!("  berkas    : {}", warp::config_path().display());
                     println!(
-                        "\nPilih \"Cloudflare WARP\" di TUI, atau cek dulu dengan `mydns warp test`."
+                        "\nPilih \"Cloudflare WARP\" di TUI. Perangkat ini juga dibuat\n\n \
+                         otomatis saat WARP pertama kali dipakai."
                     );
                 }
                 Err(e) => {
@@ -460,12 +474,17 @@ fn cmd_warp(mode: &str) {
                 println!("  SNI       : {}", config.sni);
                 println!("  berkas    : {}", warp::config_path().display());
             }
-            Err(e) => println!("WARP belum siap: {e}"),
+            Err(_) => println!(
+                "WARP belum terdaftar — perangkat dibuat otomatis saat \"Cloudflare WARP\" dipilih atau `mydns warp test` dijalankan."
+            ),
         },
         "test" | "uji" => {
             let rt = runtime();
             let outcome: Result<(), String> = rt.block_on(async {
-                let config = warp::load()?;
+                if !warp::config_path().exists() {
+                    println!("Perangkat WARP belum ada — mendaftar otomatis…");
+                }
+                let config = warp::ensure().await?;
                 let started = Instant::now();
                 let tunnel = warp::Tunnel::connect(&config).await?;
                 println!(
@@ -563,6 +582,84 @@ fn cmd_control(command: &str) {
     }
 }
 
+/// `mydns vpn on` berjalan di depan sampai Ctrl+C: tunnel hanya hidup selama
+/// proses ini hidup, dan rutenya dicabut saat keluar.
+fn cmd_vpn(args: &[String], mode: &str) {
+    match mode {
+        "status" => println!("VPN: {}", vpn::status()),
+        "off" | "matikan" => {
+            need_admin(args);
+            let rt = runtime();
+            match rt.block_on(tokio::task::spawn_blocking(vpn::down_persisted)) {
+                Ok(Ok(message)) => println!("{message}"),
+                Ok(Err(e)) => {
+                    eprintln!("gagal: {e}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("gagal menjalankan pembersihan: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "on" | "nyalakan" => {
+            need_admin(args);
+            win::install_exit_guard();
+            win::spawn_watchdog();
+            let rt = runtime();
+            let outcome: Result<(), String> = rt.block_on(async {
+                let tunnel = vpn::Vpn::up().await?;
+                println!(
+                    "VPN aktif — seluruh trafik IPv4 lewat WARP (MTU {}, {} rute)",
+                    tunnel.mtu,
+                    tunnel.routes().routes.len()
+                );
+                println!("Tekan Ctrl+C untuk mematikan.\n");
+                loop {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                            let (up, down) = tunnel.counters();
+                            println!("{up} paket keluar · {down} paket masuk");
+                        }
+                    }
+                }
+                println!("{}", tunnel.down().await?);
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                // Rute yang mungkin sudah terpasang tetap dicabut.
+                let _ = rt.block_on(tokio::task::spawn_blocking(vpn::down_persisted));
+                eprintln!("gagal: {e}");
+                std::process::exit(1);
+            }
+        }
+        "test" | "uji" => {
+            need_admin(args);
+            let rt = runtime();
+            let outcome: Result<(), String> = rt.block_on(async {
+                let started = Instant::now();
+                let tunnel = vpn::Vpn::up().await?;
+                println!(
+                    "tunnel siap dan trafik terverifikasi dalam {} ms (MTU {})",
+                    started.elapsed().as_millis(),
+                    tunnel.mtu
+                );
+                println!("{}", tunnel.down().await?);
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                eprintln!("gagal: {e}");
+                std::process::exit(1);
+            }
+        }
+        other => {
+            eprintln!("mode tidak dikenal: {other} (pakai on, off, status, atau test)");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn help() {
     println!(
         "MyDNS — DNS over QUIC / HTTP-3 untuk Windows 11
@@ -580,7 +677,11 @@ PEMAKAIAN
   mydns serve <id>      jalankan proxy saja tanpa TUI (untuk debug)
   mydns daemon [id]     proxy tanpa TUI + kontrol lewat named pipe
   mydns control <cmd>   status / restore / stop untuk daemon yang berjalan
-  mydns warp register   daftarkan perangkat Cloudflare WARP (mode MASQUE)
+  mydns vpn on          nyalakan VPN penuh (seluruh trafik lewat WARP)
+  mydns vpn off         matikan VPN dan cabut rutenya
+  mydns vpn status      keadaan tunnel VPN yang tercatat
+  mydns vpn test        buka tunnel, buktikan trafik lewat, lalu tutup
+  mydns warp register   buat ulang perangkat WARP (normalnya otomatis)
   mydns warp status     tampilkan data perangkat WARP yang tersimpan
   mydns warp test       buka tunnel WARP dan uji satu query DNS
   mydns help            pesan ini
