@@ -77,7 +77,11 @@ fn append_event(text: &str) -> Result<(), String> {
 /// Baris terakhir dari berkas log, terlama → terbaru.
 pub fn tail(count: usize) -> Result<Vec<String>, String> {
     let path = log_path();
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
     let lines: Vec<&str> = raw.lines().collect();
     let start = lines.len().saturating_sub(count);
     Ok(lines[start..].iter().map(|line| line.to_string()).collect())
