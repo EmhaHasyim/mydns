@@ -71,6 +71,7 @@ fn main() {
         "vpn" => cmd_vpn(
             &args,
             positional.get(1).map(|s| s.as_str()).unwrap_or("status"),
+            positional.get(2).map(|s| s.as_str()),
         ),
         other => {
             eprintln!("perintah tidak dikenal: {other}\n");
@@ -584,7 +585,7 @@ fn cmd_control(command: &str) {
 
 /// `mydns vpn on` berjalan di depan sampai Ctrl+C: tunnel hanya hidup selama
 /// proses ini hidup, dan rutenya dicabut saat keluar.
-fn cmd_vpn(args: &[String], mode: &str) {
+fn cmd_vpn(args: &[String], mode: &str, dns_provider: Option<&str>) {
     match mode {
         "status" => println!("VPN: {}", vpn::status()),
         "off" | "matikan" => {
@@ -608,12 +609,17 @@ fn cmd_vpn(args: &[String], mode: &str) {
             win::spawn_watchdog();
             let rt = runtime();
             let outcome: Result<(), String> = rt.block_on(async {
+                let before = vpn::exit_ip().await.unwrap_or_else(|_| "-".to_string());
                 let tunnel = vpn::Vpn::up().await?;
                 println!(
                     "VPN aktif — seluruh trafik IPv4 lewat WARP (MTU {}, {} rute)",
                     tunnel.mtu,
                     tunnel.routes().routes.len()
                 );
+                match vpn::exit_ip().await {
+                    Ok(after) => println!("IP keluar: {before} → {after}"),
+                    Err(e) => println!("IP keluar: {before} → tidak terbaca ({e})"),
+                }
                 println!("Tekan Ctrl+C untuk mematikan.\n");
                 loop {
                     tokio::select! {
@@ -639,12 +645,42 @@ fn cmd_vpn(args: &[String], mode: &str) {
             let rt = runtime();
             let outcome: Result<(), String> = rt.block_on(async {
                 let started = Instant::now();
+                let before = vpn::exit_ip().await.unwrap_or_else(|_| "-".to_string());
                 let tunnel = vpn::Vpn::up().await?;
                 println!(
                     "tunnel siap dan trafik terverifikasi dalam {} ms (MTU {})",
                     started.elapsed().as_millis(),
                     tunnel.mtu
                 );
+                match vpn::exit_ip().await {
+                    Ok(after) if after == before => println!(
+                        "IP keluar: {before} → {after} (TIDAK berubah — tunnel belum dipakai)"
+                    ),
+                    Ok(after) => println!("IP keluar: {before} → {after}"),
+                    Err(e) => println!("IP keluar: {before} → tidak terbaca ({e})"),
+                }
+                // Bukti tambahan: resolver pilihan pengguna tetap dipakai walau
+                // seluruh trafik lewat tunnel — Quad9 + VPN, bukan salah satu.
+                if let Some(id) = dns_provider {
+                    match providers::find(id) {
+                        Some(provider) => {
+                            let engine = engine::Engine::new(provider)?;
+                            let query = engine::build_query("example.com.");
+                            let started = Instant::now();
+                            match engine.resolve(&query).await {
+                                Ok((answer, proto)) => println!(
+                                    "DNS {} lewat {} di dalam tunnel: {} ms — {}",
+                                    provider.name,
+                                    proto.label(),
+                                    started.elapsed().as_millis(),
+                                    engine::describe(&answer)
+                                ),
+                                Err(e) => println!("DNS {} gagal lewat tunnel: {e}", provider.name),
+                            }
+                        }
+                        None => println!("provider tidak dikenal: {id}"),
+                    }
+                }
                 println!("{}", tunnel.down().await?);
                 Ok(())
             });

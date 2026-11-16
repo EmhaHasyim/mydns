@@ -368,6 +368,16 @@ atau tidak**. Di TUI, tombol `v` menjawabnya.
   (lebih spesifik dari default route, jadi bisa dicabut bersih), dan membawa
   **seluruh trafik IPv4** lewat tunnel WARP MASQUE yang sama dengan jalur DNS.
 
+VPN bukan pengganti pilihan resolver: resolver yang sedang dipilih tetap dipakai.
+`Quad9 + VPN` berarti query DNS tetap ke Quad9 (lewat DoQ di dalam tunnel),
+sementara seluruh trafik keluar lewat WARP. Pilih baris Quad9 lalu tekan `v`, dan
+badge kanan atas menjadi `Quad9 · DoQ + VPN`.
+
+Setelah tunnel menyala, header menampilkan **IP keluar** hasil `1.1.1.1/cdn-cgi/trace`
+— bukti bahwa jalur keluarnya benar-benar berubah. `mydns vpn test quad9`
+melakukan pengukuran yang sama dari CLI, plus satu query DNS lewat Quad9 di
+dalam tunnel.
+
 Tidak ada userspace TCP/IP stack: paket IP dari adapter Wintun diteruskan apa
 adanya sebagai HTTP Datagram CONNECT-IP, dan paket balik ditulis kembali ke
 adapter. WARP yang menyalurkan ke internet, TCP state tetap di ujung.

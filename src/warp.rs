@@ -104,6 +104,17 @@ pub fn load() -> Result<Config, String> {
     Ok(config)
 }
 
+/// Ringkasan perangkat untuk panel detail: `(device_id, endpoint)`.
+///
+/// Ditulis sebagai fungsi tersendiri supaya UI bisa memanggilnya sekali dan
+/// menyimpan hasilnya — `load` membuka kunci DPAPI, terlalu mahal untuk
+/// dipanggil pada setiap frame.
+pub fn device_summary() -> Option<(String, String)> {
+    load()
+        .ok()
+        .map(|config| (config.device_id, config.endpoint_v4))
+}
+
 /// Konfigurasi siap pakai: pakai yang tersimpan, atau daftarkan perangkat
 /// baru otomatis lalu simpan. Inilah jalur yang dipakai runtime, sehingga
 /// memilih "Cloudflare WARP" sudah cukup — pengguna tidak perlu tahu ada
@@ -962,6 +973,12 @@ impl Tunnel {
         transport.keep_alive_interval(Some(Duration::from_secs(10)));
         // HTTP Datagram (RFC 9297) berjalan di atas QUIC DATAGRAM.
         transport.datagram_receive_buffer_size(Some(1 << 16));
+        // MTU awal 1200 membuat datagram maksimum hanya ~1150 byte, sehingga
+        // adapter TUN di mode VPN penuh jatuh di bawah 1200 — batas minimum
+        // paket QUIC. Akibatnya QUIC di dalam tunnel (DoQ/DoH3) gagal dan
+        // setiap query jatuh ke DoH2. 1472 memberi ruang MTU tunnel 1280;
+        // penemuan MTU quinn tetap menurunkannya kalau jalurnya lebih kecil.
+        transport.initial_mtu(1472);
 
         let mut quic = quinn::ClientConfig::new(Arc::new(crypto));
         quic.transport_config(Arc::new(transport));

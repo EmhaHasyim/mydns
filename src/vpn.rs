@@ -14,10 +14,12 @@
 
 use crate::warp::{self, Tunnel};
 use crate::win;
+use rustls::pki_types::ServerName;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use wintun::{Adapter, Session, Wintun};
@@ -217,6 +219,51 @@ pub fn down_persisted() -> Result<String, String> {
         }
         None => Ok("VPN tidak sedang aktif".to_string()),
     }
+}
+
+/// IP publik yang terlihat oleh internet saat ini. Dipakai untuk membuktikan
+/// tunnel benar-benar mengubah jalur keluar: kalau angkanya sama sebelum dan
+/// sesudah VPN, yang berubah hanya rute di tabel, bukan trafiknya.
+///
+/// `https://1.1.1.1/cdn-cgi/trace` dipilih karena tidak butuh DNS (alamatnya
+/// literal) dan jawabannya satu baris `ip=...`.
+pub async fn exit_ip() -> Result<String, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(6),
+        tokio::net::TcpStream::connect("1.1.1.1:443"),
+    )
+    .await
+    .map_err(|_| "timeout koneksi trace".to_string())?
+    .map_err(|e| format!("koneksi trace gagal: {e}"))?;
+    let name = ServerName::try_from("1.1.1.1").map_err(|_| "nama trace tidak valid".to_string())?;
+    let mut tls = tokio::time::timeout(Duration::from_secs(6), connector.connect(name, tcp))
+        .await
+        .map_err(|_| "timeout TLS trace".to_string())?
+        .map_err(|e| format!("TLS trace gagal: {e}"))?;
+
+    tls.write_all(b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n")
+        .await
+        .map_err(|e| format!("gagal mengirim permintaan trace: {e}"))?;
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(6), tls.read_to_end(&mut raw))
+        .await
+        .map_err(|_| "timeout menunggu trace".to_string())?
+        .map_err(|e| format!("gagal membaca trace: {e}"))?;
+
+    let text = String::from_utf8_lossy(&raw);
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("ip="))
+        .map(|ip| ip.trim().to_string())
+        .ok_or_else(|| "jawaban trace tidak memuat ip=".to_string())
 }
 
 /// Versi aman untuk watchdog dan pemulihan saat logon: hanya membersihkan

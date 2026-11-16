@@ -43,7 +43,9 @@ const MIN_HEIGHT: u16 = 16;
 const DETAIL_MIN_WIDTH: u16 = 92;
 const DETAIL_WIDTH: u16 = 36;
 const HELP_WIDTH: u16 = 58;
-const HELP_HEIGHT: u16 = 12;
+/// Satu baris kosong di atas, delapan tombol, lalu satu baris petunjuk: 11
+/// baris isi + 2 border.
+const HELP_HEIGHT: u16 = 13;
 
 const HELP_KEYS: [(&str, &str); 8] = [
     ("↑ ↓ / j k", "pindah pilihan"),
@@ -97,6 +99,9 @@ pub enum Msg {
         proto: Proto,
         ms: u128,
         adapters: usize,
+        /// IP publik yang terlihat setelah tunnel menyala — bukti bahwa jalur
+        /// keluarnya benar-benar berubah, bukan hanya tabel rute.
+        exit_ip: Option<String>,
     },
     Cleared(String),
     Failed(String),
@@ -105,6 +110,9 @@ pub enum Msg {
         misses: u64,
     },
     Status(String),
+    /// (device_id, endpoint) perangkat WARP. Dibaca sekali, bukan tiap frame:
+    /// membaca `warp.json` berarti membuka kunci DPAPI.
+    WarpDevice(Option<(String, String)>),
 }
 
 pub struct Session {
@@ -141,6 +149,11 @@ pub struct App {
     tick: u64,
     /// Pilihan biner yang diminta pengguna: dengan VPN, atau DNS saja.
     vpn: bool,
+    /// IP keluar lewat tunnel, ditampilkan di header selama VPN menyala.
+    exit_ip: Option<String>,
+    /// Identitas perangkat WARP, di-cache supaya panel detail tidak membaca
+    /// berkas (dan membuka DPAPI) pada setiap frame.
+    warp_device: Option<(String, String)>,
     /// Latensi beberapa query terakhir per provider (maks 20), untuk p50 di
     /// panel detail.
     latencies: Vec<Vec<u128>>,
@@ -234,8 +247,8 @@ impl App {
         let tx = self.tx.clone();
         let session = self.session.clone();
         let log = self.log.clone();
-        // Saat VPN menyala, resolver yang dipakai adalah WARP: seluruh query
-        // ikut tunnel, tidak ada jalur DNS yang keluar sendiri.
+        // VPN tidak mengganti resolver: Quad9 + VPN tetap Quad9, hanya jalur
+        // trafiknya yang masuk tunnel.
         let vpn = self.vpn;
         rt.spawn(async move {
             apply_flow(index, vpn, session, log, tx).await;
@@ -251,12 +264,17 @@ impl App {
             return;
         }
 
-        let Some(index) = providers().iter().position(|p| p.id == "warp") else {
-            self.is_error = true;
-            self.status = "resolver WARP tidak tersedia".to_string();
-            return;
+        // VPN adalah lapisan terpisah dari resolver: Quad9 + VPN berarti query
+        // DNS tetap ke Quad9, tetapi seluruh trafik keluar lewat tunnel WARP.
+        let index = if self.cursor < providers().len() {
+            self.cursor
+        } else {
+            self.active.as_ref().map(|a| a.index).unwrap_or(0)
         };
-        if !self.begin("menyalakan VPN — seluruh trafik lewat WARP…".to_string()) {
+        if !self.begin(format!(
+            "menyalakan VPN — trafik lewat WARP, DNS {}…",
+            providers()[index].name
+        )) {
             return;
         }
         self.vpn = true;
@@ -274,6 +292,9 @@ impl App {
         if !self.begin("mengembalikan DNS ke setelan awal…".to_string()) {
             return;
         }
+        // Clear DNS mematikan tunnel juga. Tanpa ini badge tetap mengaku VPN
+        // menyala, dan enter berikutnya diam-diam menyalakannya lagi.
+        self.vpn = false;
 
         let rt = self.rt.clone();
         let tx = self.tx.clone();
@@ -301,16 +322,37 @@ impl App {
                 proto,
                 ms,
                 adapters,
+                exit_ip,
             } => {
                 self.idle();
                 self.active = Some(Active { index, proto, ms });
+                self.exit_ip = exit_ip;
+                // Perangkat WARP bisa baru terdaftar saat provider ini
+                // diterapkan; segarkan identitasnya sekali, bukan tiap frame.
+                let tx = self.tx.clone();
+                self.rt.spawn(async move {
+                    let device = tokio::task::spawn_blocking(crate::warp::device_summary)
+                        .await
+                        .ok()
+                        .flatten();
+                    let _ = tx.send(Msg::WarpDevice(device));
+                });
                 self.status = format!(
-                    "aktif · {} lewat {} · {} ms",
+                    "aktif · {} lewat {}{} · {} ms",
                     providers()[index].name,
                     proto.label(),
+                    if self.vpn { " + VPN" } else { "" },
                     ms
                 );
-                self.dns_now = format!("{adapters} adapter → 127.0.0.1  ·  proxy lokal :53");
+                self.dns_now = if self.vpn {
+                    // Ringkas: baris ini berbagi ruang dengan badge kanan.
+                    format!(
+                        "{adapters} adapter → 127.0.0.1 · {} + VPN",
+                        providers()[index].name
+                    )
+                } else {
+                    format!("{adapters} adapter → 127.0.0.1  ·  proxy lokal :53")
+                };
                 if let Some(samples) = self.latencies.get_mut(index) {
                     samples.push(ms);
                     if samples.len() > 20 {
@@ -328,6 +370,10 @@ impl App {
             Msg::Cleared(text) => {
                 self.idle();
                 self.active = None;
+                self.exit_ip = None;
+                // Semua jalur "clear" mencabut tunnel, jadi state layar harus
+                // mengikuti tanpa menunggu jalur mana yang dipakai.
+                self.vpn = false;
                 self.hits = 0;
                 self.misses = 0;
                 self.dns_now = "setelan DNS asli dipulihkan".to_string();
@@ -349,6 +395,7 @@ impl App {
                 self.misses = misses;
             }
             Msg::Status(summary) => self.dns_now = format_status(&summary),
+            Msg::WarpDevice(device) => self.warp_device = device,
         }
     }
 
@@ -366,7 +413,9 @@ impl App {
         let [header, body, status, footer] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(1),
+            // Dua baris: pesan gagal (mis. alasan tunnel ditolak) panjang, dan
+            // satu baris membuat alasannya terpotong tanpa jejak.
+            Constraint::Length(2),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -413,11 +462,16 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // Badge menyusut di terminal sempit supaya baris DNS di kiri tidak
+        // terpotong di tengah alamat proxy.
+        let badge_width = if inner.width >= 76 { 34 } else { 24 };
         let [title_area, badge_area] =
-            Layout::horizontal([Constraint::Min(20), Constraint::Length(34)]).areas(inner);
+            Layout::horizontal([Constraint::Min(20), Constraint::Length(badge_width)]).areas(inner);
 
+        // 127.0.0.1 adalah keadaan normal selama sesi aktif; kuning hanya untuk
+        // sisa sesi lama yang menunjuk proxy yang sudah mati.
         let dns_color = if self.dns_now.contains("127.0.0.1") {
-            WARN
+            if self.active.is_some() { OK } else { WARN }
         } else {
             MUTED
         };
@@ -439,20 +493,35 @@ impl App {
             Some(active) => (
                 "●",
                 format!(
-                    "{} · {}",
+                    "{} · {}{}",
                     providers()[active.index].name,
-                    active.proto.label()
+                    active.proto.label(),
+                    if self.vpn { " + VPN" } else { "" }
                 ),
                 OK,
             ),
+            None if self.vpn => ("◐", "VPN menyala".to_string(), WARN),
             None => ("○", "tidak aktif".to_string(), MUTED),
         };
-        let badge = Paragraph::new(Line::from(vec![
+        // IP keluar ada di sini, bukan di baris DNS: baris kiri bisa terpotong
+        // pada terminal 80 kolom, dan justru angka inilah bukti VPN bekerja.
+        let mut badge_lines = vec![Line::from(vec![
             Span::styled(format!("{dot} "), fg(color)),
             Span::styled(label, fg(color)),
-        ]))
-        .alignment(Alignment::Right)
-        .style(bg(SURFACE));
+        ])];
+        if let Some(ip) = self.exit_ip.as_deref() {
+            // "IP keluar" utuh butuh 24 karakter; di terminal sempit dipendekkan
+            // supaya angkanya tidak terpotong.
+            let label = if badge_width >= 30 {
+                format!("IP keluar {ip}")
+            } else {
+                format!("IP {ip}")
+            };
+            badge_lines.push(Line::from(Span::styled(label, fg(OK))));
+        }
+        let badge = Paragraph::new(badge_lines)
+            .alignment(Alignment::Right)
+            .style(bg(SURFACE));
         frame.render_widget(badge, badge_area);
     }
 
@@ -504,7 +573,7 @@ impl App {
             rows,
             [
                 Constraint::Length(17),
-                Constraint::Length(10),
+                Constraint::Length(11),
                 Constraint::Min(14),
             ],
         )
@@ -555,12 +624,12 @@ impl App {
                 Line::default(),
                 heading("PERANGKAT"),
             ];
-            match crate::warp::load() {
-                Ok(config) => {
-                    lines.push(text(config.device_id.clone(), fg(TEXT)));
-                    lines.push(text(config.endpoint_v4, fg(MUTED)));
+            match self.warp_device.as_ref() {
+                Some((device, endpoint)) => {
+                    lines.push(text(device.clone(), fg(TEXT)));
+                    lines.push(text(endpoint.clone(), fg(MUTED)));
                 }
-                Err(_) => lines.push(text("didaftarkan otomatis saat WARP dipakai", fg(MUTED))),
+                None => lines.push(text("didaftarkan otomatis saat WARP dipakai", fg(MUTED))),
             }
             if let Some(active) = self.active.as_ref().filter(|a| a.index == self.cursor) {
                 lines.push(Line::default());
@@ -575,6 +644,7 @@ impl App {
                     lines.push(text(summary, fg(MUTED)));
                 }
             }
+            lines.extend(self.vpn_detail_lines());
             return lines;
         }
 
@@ -598,7 +668,8 @@ impl App {
 
         lines.push(heading("DOH  ·  HTTPS 443"));
         lines.push(match provider.doh {
-            Some(url) => text(url, fg(TEXT)),
+            // Tanpa skema: URL panjang tidak lagi terpotong di tengah kata.
+            Some(url) => text(url.trim_start_matches("https://"), fg(TEXT)),
             None => text("tidak tersedia", fg(MUTED)),
         });
         lines.push(Line::default());
@@ -611,12 +682,35 @@ impl App {
             lines.push(Line::from(vec![
                 Span::styled("● aktif ", fg(OK)),
                 Span::styled(
-                    format!("· {} · {} ms", active.proto.label(), active.ms),
+                    format!(
+                        "· {} · {} ms{}",
+                        active.proto.label(),
+                        active.ms,
+                        if self.vpn { " · VPN" } else { "" }
+                    ),
                     fg(MUTED),
                 ),
             ]));
         }
 
+        lines.extend(self.vpn_detail_lines());
+        lines
+    }
+
+    /// Bagian panel detail yang hanya muncul saat VPN menyala.
+    fn vpn_detail_lines(&self) -> Vec<Line<'static>> {
+        if !self.vpn {
+            return Vec::new();
+        }
+        let mut lines = vec![
+            Line::default(),
+            heading("VPN  ·  FULL TUNNEL"),
+            text("seluruh trafik IPv4 lewat WARP", fg(TEXT)),
+        ];
+        match self.exit_ip.as_deref() {
+            Some(ip) => lines.push(text(format!("IP keluar {ip}"), fg(OK))),
+            None => lines.push(text("IP keluar belum terukur", fg(MUTED))),
+        }
         lines
     }
 
@@ -659,45 +753,74 @@ impl App {
                 fg(if self.is_error { ERR } else { TEXT }),
             ),
         ]))
+        .wrap(Wrap { trim: false })
         .style(bg(SURFACE));
         frame.render_widget(status, area);
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+        // Angka cache hanya muncul kalau memang ada ruang; pada terminal sempit
+        // tombol `q keluar` lebih penting daripada statistik.
+        let show_cache = area.width >= 92;
+        let cache_width = if show_cache { 32 } else { 0 };
         let [keys_area, cache_area] =
-            Layout::horizontal([Constraint::Min(30), Constraint::Length(32)]).areas(area);
+            Layout::horizontal([Constraint::Min(20), Constraint::Length(cache_width)]).areas(area);
 
         let key = |k: &'static str| Span::styled(k, fg(ACCENT));
         let hint = |t: &'static str| Span::styled(t, fg(MUTED));
-        let keys = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            key("↑↓"),
-            hint(" pilih   "),
-            key("enter"),
-            hint(" terapkan   "),
-            key("c"),
-            hint(" clear   "),
-            key("?"),
-            hint(" bantuan   "),
-            key("q"),
-            hint(" keluar"),
-        ]))
+        // Dua kepadatan: label penuh kalau muat, singkat kalau tidak — supaya
+        // tidak ada tombol yang terpotong di terminal 60–75 kolom.
+        let keys = if area.width >= 76 {
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                key("↑↓"),
+                hint(" pilih   "),
+                key("enter"),
+                hint(" terapkan   "),
+                key("v"),
+                hint(" vpn   "),
+                key("c"),
+                hint(" clear   "),
+                key("?"),
+                hint(" bantuan   "),
+                key("q"),
+                hint(" keluar"),
+            ]))
+        } else {
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                key("↑↓"),
+                hint(" "),
+                key("enter"),
+                hint(" "),
+                key("v"),
+                hint(" vpn "),
+                key("c"),
+                hint(" clear "),
+                key("?"),
+                hint(" "),
+                key("q"),
+                hint(" keluar"),
+            ]))
+        }
         .style(bg(SURFACE));
         frame.render_widget(keys, keys_area);
 
-        let cache = if self.active.is_some() {
-            format!(
-                "{} hit · {} miss ",
-                compact(self.hits),
-                compact(self.misses)
-            )
-        } else {
-            "cache —  ".to_string()
-        };
-        let cache_widget = Paragraph::new(Span::styled(cache, fg(MUTED)))
-            .alignment(Alignment::Right)
-            .style(bg(SURFACE));
-        frame.render_widget(cache_widget, cache_area);
+        if show_cache {
+            let cache = if self.active.is_some() {
+                format!(
+                    "{} hit · {} miss ",
+                    compact(self.hits),
+                    compact(self.misses)
+                )
+            } else {
+                "cache —  ".to_string()
+            };
+            let cache_widget = Paragraph::new(Span::styled(cache, fg(MUTED)))
+                .alignment(Alignment::Right)
+                .style(bg(SURFACE));
+            frame.render_widget(cache_widget, cache_area);
+        }
     }
 
     /// Panel log: query terakhir, terbaru di baris paling bawah.
@@ -898,6 +1021,7 @@ async fn apply_flow(
     } else {
         None
     };
+    let vpn_running = vpn.is_some();
 
     // 4. Baru arahkan adapter ke loopback.
     let id = provider.id;
@@ -1026,11 +1150,20 @@ async fn apply_flow(
         "{} adapter diarahkan ke 127.0.0.1",
         adapters.len()
     )));
+    // Ukur IP keluar lewat tunnel: satu-satunya bukti yang berarti bagi
+    // pengguna bahwa VPN benar-benar mengubah jalur, bukan hanya rute.
+    let exit_ip = if vpn_running {
+        crate::vpn::exit_ip().await.ok()
+    } else {
+        None
+    };
+
     let _ = tx.send(Msg::Applied {
         index,
         proto,
         ms,
         adapters: adapters.len(),
+        exit_ip,
     });
 }
 
@@ -1057,6 +1190,8 @@ pub fn run(
         misses: 0,
         tick: 0,
         vpn: false,
+        exit_ip: None,
+        warp_device: None,
         latencies: vec![Vec::new(); providers().len()],
     };
 
@@ -1067,6 +1202,19 @@ pub fn run(
             if let Ok(summary) = tokio::task::spawn_blocking(win::summary).await {
                 let _ = tx.send(Msg::Status(summary));
             }
+        });
+    }
+
+    // Identitas perangkat WARP dibaca sekali di awal; panel detail tidak boleh
+    // membuka kunci DPAPI pada setiap frame.
+    {
+        let tx = app.tx.clone();
+        app.rt.spawn(async move {
+            let device = tokio::task::spawn_blocking(crate::warp::device_summary)
+                .await
+                .ok()
+                .flatten();
+            let _ = tx.send(Msg::WarpDevice(device));
         });
     }
 
@@ -1123,4 +1271,178 @@ pub fn run(
     });
 
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn app() -> App {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime uji");
+        let handle = rt.handle().clone();
+        // Runtime harus hidup selama `App` memegang handle-nya; tes tidak perlu
+        // mematikannya, dan ini tidak menahan apa pun yang berjalan.
+        std::mem::forget(rt);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App {
+            rt: handle,
+            tx,
+            session: Arc::new(Mutex::new(None)),
+            log: Arc::new(Log::new()),
+            cursor: 0,
+            active: None,
+            status: "siap".to_string(),
+            dns_now: "2 adapter → 127.0.0.1".to_string(),
+            is_error: false,
+            busy: false,
+            quit: false,
+            show_help: false,
+            show_log: false,
+            hits: 0,
+            misses: 0,
+            tick: 0,
+            vpn: false,
+            exit_ip: None,
+            warp_device: None,
+            latencies: vec![Vec::new(); providers().len()],
+        }
+    }
+
+    /// Render satu frame lalu kembalikan isi layar baris per baris.
+    fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal uji");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("menggambar TUI");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| {
+                        buffer
+                            .cell((x, y))
+                            .map(|cell| cell.symbol().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn joined(lines: &[String]) -> String {
+        lines.join("\n")
+    }
+
+    #[test]
+    fn header_dan_footer_muat_tombol_vpn() {
+        let app = app();
+        let text = joined(&screen(&app, 100, 24));
+        assert!(text.contains("MyDNS"), "{text}");
+        assert!(text.contains("tidak aktif"), "{text}");
+        assert!(
+            text.contains("vpn"),
+            "footer harus menyebut tombol v: {text}"
+        );
+        assert!(text.contains("Quad9"), "{text}");
+    }
+
+    #[test]
+    fn bantuan_tidak_terpotong() {
+        let mut app = app();
+        app.show_help = true;
+        let text = joined(&screen(&app, 80, 24));
+        // Baris terakhir panel bantuan paling mudah terpotong kalau tingginya
+        // kurang satu baris.
+        assert!(
+            text.contains("Aksi apa pun yang butuh hak admin"),
+            "baris terakhir bantuan terpotong: {text}"
+        );
+        assert!(text.contains("vpn"), "{text}");
+    }
+
+    #[test]
+    fn detail_menampilkan_tunnel_dan_ip_keluar() {
+        let mut app = app();
+        app.cursor = 1;
+        app.vpn = true;
+        app.exit_ip = Some("104.28.215.130".to_string());
+        app.active = Some(Active {
+            index: 1,
+            proto: Proto::DoQ,
+            ms: 24,
+        });
+        let lines = screen(&app, 120, 30);
+        let text = joined(&lines);
+        assert!(text.contains("FULL TUNNEL"), "{text}");
+        assert!(
+            text.contains("104.28.215.130"),
+            "IP keluar tidak tampil: {text}"
+        );
+        assert!(
+            text.contains("+ VPN"),
+            "badge/aktif harus menandai VPN: {text}"
+        );
+        // IP keluar tidak boleh hilang walau baris DNS panjang.
+        let header = &lines[1];
+        assert!(header.contains("104.28.215.130"), "header: {header}");
+    }
+
+    #[test]
+    fn clear_dns_mematikan_vpn_di_layar() {
+        let mut app = app();
+        app.vpn = true;
+        app.cursor = providers().len();
+        app.on_msg(Msg::Cleared("DNS dipulihkan".to_string()));
+        let text = joined(&screen(&app, 100, 24));
+        assert!(!text.contains("VPN menyala"), "{text}");
+        assert!(!text.contains("+ VPN"), "{text}");
+    }
+
+    #[test]
+    fn pesan_gagal_panjang_tidak_terpotong() {
+        let mut app = app();
+        app.is_error = true;
+        app.status = "tunnel tidak meneruskan trafik (1.1.1.1:443: unreachable) — rute VPN dicabut"
+            .to_string();
+        let text = joined(&screen(&app, 80, 24));
+        assert!(
+            text.contains("rute VPN dicabut"),
+            "akhir pesan gagal terpotong: {text}"
+        );
+    }
+
+    #[test]
+    fn tata_letak_muat_di_terminal_sempit() {
+        let mut app = app();
+        app.cursor = 1;
+        app.vpn = true;
+        app.exit_ip = Some("104.28.215.130".to_string());
+        app.active = Some(Active {
+            index: 1,
+            proto: Proto::DoQ,
+            ms: 24,
+        });
+        let text = joined(&screen(&app, 60, 18));
+        // Footer harus utuh sampai tombol keluar, header harus tetap utuh.
+        assert!(text.contains("keluar"), "footer terpotong: {text}");
+        assert!(text.contains("127.0.0.1"), "baris DNS terpotong: {text}");
+        assert!(
+            text.contains("IP 104.28.215.130"),
+            "IP keluar terpotong di terminal sempit: {text}"
+        );
+    }
+
+    #[test]
+    fn terminal_kecil_memberi_petunjuk() {
+        let app = app();
+        let text = joined(&screen(&app, 40, 10));
+        assert!(text.contains("terlalu kecil"), "{text}");
+    }
 }
