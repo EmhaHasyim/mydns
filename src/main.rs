@@ -1,16 +1,18 @@
 //! MyDNS — pengalih DNS Windows 11 ke DoQ / DoH3 (QUIC) lewat proxy loopback.
 
+mod daemon;
 mod engine;
 mod log;
 mod providers;
 mod server;
 mod ui;
+mod warp;
 mod win;
 
 use crate::log::Log;
 use crate::providers::{config_path, providers as resolver_list, read_config};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,11 +48,25 @@ fn main() {
         "test" => cmd_test(),
         "providers" => cmd_providers(),
         "doctor" => cmd_doctor(),
+        "log" => cmd_log(
+            positional
+                .get(1)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(40),
+        ),
         "autostart" => cmd_autostart(
             &args,
             positional.get(1).map(|s| s.as_str()).unwrap_or("status"),
         ),
         "serve" => cmd_serve(positional.get(1).map(|s| s.as_str()).unwrap_or("adguard")),
+        "daemon" => cmd_daemon(
+            positional
+                .get(1)
+                .map(|s| s.as_str())
+                .unwrap_or("cloudflare"),
+        ),
+        "control" => cmd_control(positional.get(1).map(|s| s.as_str()).unwrap_or("status")),
+        "warp" => cmd_warp(positional.get(1).map(|s| s.as_str()).unwrap_or("status")),
         other => {
             eprintln!("perintah tidak dikenal: {other}\n");
             help();
@@ -187,6 +203,11 @@ fn cmd_doctor() {
     } else {
         info("port 53 loopback sedang dipakai");
     }
+    if win::port53_v6_free() {
+        info("port 53 IPv6 loopback bebas");
+    } else {
+        info("port 53 IPv6 loopback sedang dipakai");
+    }
 
     match rt.block_on(server::probe()) {
         Ok(detail) => okay(&format!("proxy lokal menjawab — {detail}")),
@@ -266,6 +287,23 @@ fn cmd_doctor() {
     }
 }
 
+fn cmd_log(count: usize) {
+    let count = count.clamp(1, 500);
+    println!("Log: {}\n", log::log_path().display());
+    match log::tail(count) {
+        Ok(lines) if lines.is_empty() => println!("(belum ada catatan)"),
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("belum ada log: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_providers() {
     let list = resolver_list();
     println!("Resolver yang tersedia ({}):\n", list.len());
@@ -278,7 +316,12 @@ fn cmd_providers() {
         if let Some(url) = provider.doh {
             println!("  {:<12} DoH     {url}", "");
         }
-        println!("  {:<12} IP      {}", "", provider.boot.join(", "));
+        if provider.warp {
+            println!("  {:<12} MASQUE  tunnel CONNECT-IP Cloudflare", "");
+        }
+        if !provider.boot.is_empty() {
+            println!("  {:<12} IP      {}", "", provider.boot.join(", "));
+        }
         println!();
     }
 
@@ -383,6 +426,75 @@ fn cmd_test() {
     });
 }
 
+fn cmd_warp(mode: &str) {
+    match mode {
+        "register" | "daftar" => {
+            let rt = runtime();
+            println!("Mendaftarkan perangkat WARP baru (mode MASQUE)…\n");
+            match rt.block_on(warp::register()) {
+                Ok(config) => {
+                    println!("WARP siap dipakai.\n");
+                    println!("  perangkat : {}", config.device_id);
+                    println!("  endpoint  : {}", config.endpoint_v4);
+                    println!("  tunnel IP : {}", config.ipv4);
+                    println!("  berkas    : {}", warp::config_path().display());
+                    println!(
+                        "\nPilih \"Cloudflare WARP\" di TUI, atau cek dulu dengan `mydns warp test`."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("gagal mendaftar: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "status" => match warp::load() {
+            Ok(config) => {
+                println!("WARP terdaftar:\n");
+                println!("  perangkat : {}", config.device_id);
+                println!("  endpoint  : {}", config.endpoint_v4);
+                if !config.endpoint_v6.is_empty() {
+                    println!("  endpoint6 : {}", config.endpoint_v6);
+                }
+                println!("  tunnel IP : {}", config.ipv4);
+                println!("  SNI       : {}", config.sni);
+                println!("  berkas    : {}", warp::config_path().display());
+            }
+            Err(e) => println!("WARP belum siap: {e}"),
+        },
+        "test" | "uji" => {
+            let rt = runtime();
+            let outcome: Result<(), String> = rt.block_on(async {
+                let config = warp::load()?;
+                let started = Instant::now();
+                let tunnel = warp::Tunnel::connect(&config).await?;
+                println!(
+                    "tunnel    : siap dalam {} ms",
+                    started.elapsed().as_millis()
+                );
+
+                let query = engine::build_query("example.com.");
+                let started = Instant::now();
+                let answer = tunnel.resolve(&query).await?;
+                println!(
+                    "example.com/A : {} ms — {}",
+                    started.elapsed().as_millis(),
+                    engine::describe(&answer)
+                );
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                eprintln!("gagal: {e}");
+                std::process::exit(1);
+            }
+        }
+        other => {
+            eprintln!("mode tidak dikenal: {other} (pakai register, status, atau test)");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn cmd_serve(provider_id: &str) {
     let Some(provider) = providers::find(provider_id) else {
         eprintln!(
@@ -434,6 +546,23 @@ fn cmd_serve(provider_id: &str) {
     }
 }
 
+fn cmd_daemon(provider_id: &str) {
+    if let Err(e) = daemon::run(provider_id) {
+        eprintln!("gagal: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn cmd_control(command: &str) {
+    match daemon::control(command) {
+        Ok(reply) => println!("{reply}"),
+        Err(e) => {
+            eprintln!("gagal: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn help() {
     println!(
         "MyDNS — DNS over QUIC / HTTP-3 untuk Windows 11
@@ -443,11 +572,17 @@ PEMAKAIAN
   mydns status          tampilkan DNS adapter yang aktif sekarang
   mydns restore         kembalikan DNS ke setelan asli (DHCP / statis)
   mydns doctor          periksa kesehatan pengalihan DNS (tanpa mengubah apa pun)
+  mydns log [n]         tampilkan n baris terakhir log peristiwa
   mydns autostart on    pulihkan DNS otomatis setiap logon (disarankan)
   mydns autostart off   lepaskan pemulihan otomatis itu
   mydns providers       daftar resolver aktif + berkas kustom yang dibaca
   mydns test            uji DoQ, DoH3, DoH2 ke semua provider + latensi
   mydns serve <id>      jalankan proxy saja tanpa TUI (untuk debug)
+  mydns daemon [id]     proxy tanpa TUI + kontrol lewat named pipe
+  mydns control <cmd>   status / restore / stop untuk daemon yang berjalan
+  mydns warp register   daftarkan perangkat Cloudflare WARP (mode MASQUE)
+  mydns warp status     tampilkan data perangkat WARP yang tersimpan
+  mydns warp test       buka tunnel WARP dan uji satu query DNS
   mydns help            pesan ini
 
 PROVIDER
@@ -460,7 +595,8 @@ CATATAN
   • Kalau prosesnya dibunuh atau mesin mati mendadak, pendamping kecil yang
     dijalankan TUI akan memulihkan DNS; `mydns autostart on` menutup kasus
     reboot dengan menjalankan pemulihan saat logon.
-  • Perubahan adapter butuh hak administrator (prompt UAC).
+  • Perubahan adapter butuh hak administrator (prompt UAC). Daemon tetap
+    bisa melayani proxy tanpa admin; DNS-nya saja yang tidak diubah.
   • Kalau port 53 sudah dipakai proses lain (Docker, AdGuard Home, VPN),
     aplikasi menolak mengubah DNS dan menampilkan error.
   • DNS baru dianggap berhasil setelah resolver sistem benar-benar menjawab;

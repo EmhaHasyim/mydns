@@ -16,6 +16,7 @@ hickory-proto = "0.26.3"
 http = "1.5.0"
 quinn = "0.11.12"
 ratatui = "0.30.2"
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -26,12 +27,14 @@ tokio = { version = "1.54.1", features = [
     "time",
     "io-util",
     "macros",
+    "signal",
 ] }
 tokio-rustls = "0.26.6"
 webpki-roots = "1.0.12"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",

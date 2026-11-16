@@ -10,6 +10,7 @@ lewat proxy lokal. Satu file `.exe`, tanpa runtime, tanpa layanan latar belakang
     Quad9          DoQ · DoH3   blokir malware, DNSSEC
     AdGuard DNS    DoQ · DoH3   blokir iklan + tracker
     Control D      DoQ · DoH3   Hagezi Ultimate
+    WARP (MASQUE)               DNS lewat tunnel Cloudflare WARP
     Clear DNS                   kembalikan ke DHCP / server asli
 ```
 
@@ -123,12 +124,29 @@ di TUI yang mudah dipakai:
 | `mydns restore` | pulihkan DNS asli tanpa TUI |
 | `mydns providers` | daftar resolver aktif + berkas kustom yang dibaca |
 | `mydns doctor` | periksa kesehatan pengalihan DNS (tanpa mengubah apa pun) |
+| `mydns log [n]` | tampilkan n baris terakhir log peristiwa |
 | `mydns autostart on` | pulihkan DNS otomatis setiap logon (disarankan) |
 | `mydns autostart off` | lepaskan pemulihan otomatis itu |
 | `mydns test` | uji DoQ / DoH3 / DoH2 ke semua provider + latensi |
 | `mydns serve adguard` | jalankan proxy saja (debug), tanpa mengubah DNS |
+| `mydns daemon [id]` | proxy tanpa TUI + kontrol lewat named pipe (tetap jalan saat TUI tertutup) |
+| `mydns control status` | tanya daemon: provider, uptime, cache, query diteruskan |
+| `mydns control restore` | minta daemon memulihkan DNS tanpa berhenti |
+| `mydns control stop` | hentikan daemon (DNS dipulihkan dulu) |
+| `mydns warp register` | daftarkan perangkat Cloudflare WARP (sekali saja) |
+| `mydns warp status` | tampilkan data perangkat WARP yang tersimpan |
+| `mydns warp test` | buka tunnel WARP dan uji satu query DNS |
 
 `mydns test` dan `mydns serve` **tidak** butuh admin dan tidak mengubah setelan DNS.
+
+`mydns daemon` berguna kalau proxy harus hidup tanpa terminal TUI: DNS tetap
+dialihkan, dan `mydns control ...` bisa dipanggil dari jendela lain. Perintah
+kontrol yang tidak dijalankan dengan hak admin tetap bisa memakai daemon; hanya
+pengalihan DNS-nya yang butuh admin (dan dilaporkan, bukan didiamkan).
+
+Peristiwa penting (apply, restore, registrasi WARP, kegagalan) ditulis ke
+`%LOCALAPPDATA%\MyDns\mydns.log` dan bisa dibaca dengan `mydns log`. Log tidak
+pernah menggagalkan DNS: kalau berkasnya tidak bisa ditulis, aplikasi lanjut.
 
 ## Pengaman: DNS tidak pernah tertinggal rusak
 
@@ -228,18 +246,77 @@ cloudflare | Cloudflare | 1.1.1.1, tanpa filter | - | https://cloudflare-dns.com
   konfigurasi yang dipakai. Untuk pengujian, arahkan `MYDNS_RESOLVERS` ke berkas
   lain.
 
+## Cloudflare WARP (mode MASQUE)
+
+Resolver kelima: query DNS dikirim **di dalam tunnel MASQUE Cloudflare WARP**
+(`CONNECT-IP`, RFC 9484 di atas HTTP/3), bukan lewat DoQ/DoH3. Yang menyeberang
+hanya query DNS — tidak ada adapter TUN dan tidak ada route yang diubah, jadi
+sisa trafik tetap memakai koneksi biasa.
+
+Sekali saja, daftarkan perangkat:
+
+```powershell
+mydns warp register
+```
+
+Perintah itu memanggil API Cloudflare (buat perangkat WireGuard, lalu tukar
+kuncinya ke kunci P-256 untuk mode MASQUE) dan menyimpan hasilnya di
+`%APPDATA%\MyDns\warp.json`. Sesudah itu baris **WARP (MASQUE)** di TUI bisa
+dipilih seperti resolver lain.
+
+Periksa dan uji kapan saja:
+
+```powershell
+mydns warp status
+mydns warp test
+```
+
+`warp test` membuka tunnel lalu mengirim satu query `example.com/A` ke
+`1.1.1.1:53` di dalam tunnel:
+
+```
+tunnel        : siap dalam 470 ms
+example.com/A : 40 ms — 2 jawaban, NoError, 104.20.23.154 ttl=171
+```
+
+Yang perlu diketahui:
+
+- **Autentikasi memakai mTLS**: sertifikat P-256 yang dibuat sendiri saat
+  registrasi, dan identitas server diverifikasi dengan *pinning* public key dari
+  respons registrasi — endpoint WARP memang tidak punya nama di WebPKI.
+- **Tanpa TUN, tanpa route baru.** Tunnel hanya membawa paket IPv4/UDP ke
+  resolver WARP; aplikasi ini tidak bisa dipakai meneruskan trafik lain.
+- **Header `CONNECT-IP` disusun sendiri.** `h3` hanya mengenal `connect-udp` dan
+  `webtransport` pada `:protocol`, sedangkan WARP memakai nama Cloudflare
+  `cf-connect-ip`, jadi field section QPACK-nya dirakit langsung.
+- `warp.json` berisi kunci privat perangkat, tetapi disimpan **terenkripsi
+  DPAPI** sehingga hanya user Windows yang sama di mesin ini yang bisa
+  membukanya. Berkas lama berisi base64 biasa tetap dibaca, lalu dienkripsi saat
+  disimpan lagi. `mydns warp register` ulang akan membuat perangkat baru.
+
 ## Tes
 
 ```powershell
 cargo test
 ```
 
-Empat belas tes menutupi jalur yang memproses byte dari jaringan dan berkas
-konfigurasi, yang tidak bisa diperiksa dengan mata:
+Tiga puluh empat tes menutupi jalur yang memproses byte dari jaringan dan berkas
+konfigurasi, yang tidak bisa diperiksa dengan mata. CI Windows menjalankan
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, dan `cargo test`:
 
 | Tes | Yang dijaga |
 |---|---|
 | `cache_key_menormalkan_nama` | `Example.COM.` dan `example.com` memakai entri cache yang sama |
+| `cache_key_memisahkan_dnssec_dan_cd` | klien DO/CD tidak berbagi entri dengan klien biasa |
+| `cache_hit_menurunkan_ttl_dan_mengganti_id` | TTL yang dikirim ke klien tidak melebihi sisa umur cache; ID query dipasang kembali |
+| `opcode_bukan_query_tidak_dicache` | UPDATE/NOTIFY tidak pernah masuk cache |
+| `respons_tidak_cocok_dengan_query_ditolak` | ID atau pertanyaan yang berbeda ditolak, bukan diteruskan |
+| `cache_penuh_membuang_entri_paling_tua` | cache penuh membuang entri tertua, bukan mengosongkan semuanya |
+| `hedge_doh3_mendahulukan_doh2_saat_sibuk` | antrean DoH3 penuh memindahkan DoH2 ke depan |
+| `restore_memakai_nama_saat_index_berubah` | index adapter berubah, setelan asli tetap dipulihkan lewat nama |
+| `restore_melewati_adapter_yang_sudah_hilang` | adapter yang sudah tidak ada tidak dipaksa ke index lain |
+| `kunci_privat_bolak_balik_lewat_dpapi` | kunci privat WARP terenkripsi dan bisa dibuka kembali |
+| `timestamp_berbentuk_iso` | baris log memakai tanggal UTC yang konsisten |
 | `fit_udp_memotong_paket_besar_dengan_bit_tc` | respons TXT 639 byte dipotong ≤ 512 byte, TC diset, ID utuh |
 | `fit_udp_membiarkan_tcp_dan_paket_kecil` | TCP tidak dipotong, paket kecil lewat utuh |
 | `servfail_*` | SERVFAIL mempertahankan ID, menandai QR + RCODE, mengosongkan hitungan |
@@ -249,6 +326,11 @@ konfigurasi, yang tidak bisa diperiksa dengan mata:
 | `baris_lengkap_terbaca`, `komentar_dan_baris_kosong_diabaikan`, `port_default_853` | format `resolvers.txt` terbaca sesuai dokumentasi |
 | `baris_bermasalah_dilaporkan_bukan_dipaksa` | id kosong/id ilegal/tanpa endpoint/IP salah dilaporkan dengan nomor baris |
 | `bawaan_tetap_ada_dan_urutannya_stabil` | urutan bawaan tidak berubah dan setiap resolver punya IP bootstrap |
+| `checksum_header_dan_udp_benar`, `paket_udp_putar_balik` | paket IPv4+UDP yang dibangun untuk tunnel bisa diurai kembali, checksum benar |
+| `sertifikat_bisa_dibaca_kembali` | sertifikat P-256 self-signed hasil DER buatan sendiri valid |
+| `spki_menempel_pada_titik_p256`, `public_key_pem_dan_base64_sama_saja` | kunci publik diekstrak dari PKCS#8; jawaban PEM maupun base64 diperlakukan sama |
+| `varint_menyandikan_semua_ukuran` | QUIC varint bolak-balik di semua lebar |
+| `endpoint_port_nol_menjadi_443`, `base64_bolak_balik`, `udp_to_port_menolak_paket_lain` | normalisasi endpoint, base64 tanpa padding, dan penyaringan datagram asing |
 
 ## Kinerja terukur
 
@@ -259,8 +341,12 @@ konfigurasi, yang tidak bisa diperiksa dengan mata:
 | Membaca DNS adapter | `GetAdaptersAddresses` (~1 ms); PowerShell hanya cadangan |
 | Latensi query ke resolver | 22–50 ms lewat DoQ / DoH3 |
 | Query dari cache | < 1 ms (loopback) |
+| 20 query identik bersamaan | 1 kali diteruskan (3–4 ms total), sisanya ikut hasil yang sama |
+| 20 query paralel nama berbeda | 281 ms (sebelum hedge DoH3: 863 ms) |
+| Jawaban cache | TTL diturunkan sesuai sisa umur (maks 60 detik) |
 | Build | `cargo build --release`: 0 warning, `cargo clippy` bersih |
 | Uji 25 query paralel | selesai tanpa error |
+| IP bootstrap IPv6 | Cloudflare/Quad9/AdGuard punya jalur v6, dipakai setelah v4 gagal |
 
 Yang dihitung hanya adapter berstatus **Up** dan punya gateway. Adapter yang
 sedang Disconnected (mis. Wi-Fi saat memakai kabel) sengaja tidak disentuh,
@@ -274,13 +360,31 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
   berikutnya (kalau `mydns autostart on` pernah dijalankan).
 - **Port 53 harus kosong.** Kalau Docker Desktop, AdGuard Home, atau VPN sudah
   memakai `127.0.0.1:53`, aplikasi menolak mengubah DNS dan menampilkan error.
+- **DNS IPv6 hanya dipasang kalau listener `[::1]:53` benar-benar aktif.** Kalau
+  bind IPv6 gagal, adapter tidak diarahkan ke `::1`, supaya resolusi IPv6 tidak
+  menunjuk port yang mati.
 - **Berkas kustom dibaca sekali saat start.** Setelah mengedit
   `resolvers.txt`, buka ulang TUI (atau jalankan perintah lain) agar terbaca.
-- **Cache lokal dibatasi 60 detik** meskipun TTL dari upstream lebih panjang,
-  supaya rekaman tidak basi di tangan klien.
-- **Belum ada mode Windows service**, jadi filter DNS belum bisa "set once,
-  jalan terus" tanpa terminal terbuka; yang dijamin hanya pemulihan otomatis,
-  bukan proxy yang hidup terus.
+- **Cache lokal dibatasi 60 detik** meskipun TTL dari upstream lebih panjang.
+  TTL pada jawaban cache ikut diturunkan ke sisa umurnya, jadi klien tidak
+  menyimpan rekaman lebih lama daripada cache kita. Entri dipisahkan per bit
+  DNSSEC-OK dan CD, sehingga klien DNSSEC tidak pernah menerima jawaban tanpa
+  RRSIG dari cache. Query yang membawa opsi EDNS (COOKIE, ECS) tidak dicache.
+- **DoH3 masih berurutan per koneksi.** Satu koneksi HTTP/3 melayani satu query
+  pada satu waktu. Percobaan memakai banyak request sekaligus di satu koneksi
+  membuat sebagian server (Quad9) berhenti menjawab, dan beberapa koneksi QUIC
+  yang dibuka serentak ke IP bootstrap yang sama sering ditolak jaringan ini.
+  Karena itu, begitu antrean DoH3 penuh, query dialihkan ke DoH2 yang mendukung
+  banyak request paralel (20 query paralel: 281 ms, dari 863 ms sebelumnya).
+  DoQ (satu stream per query) juga tetap paralel.
+- **Query identik yang datang bersamaan diteruskan sekali.** Sisanya menunggu
+  lalu mengambil hasil dari cache, jadi lonjakan query yang sama tidak
+  menggandakan trafik ke resolver.
+- **`mydns daemon` belum didaftarkan sebagai Windows service (SCM).** Prosesnya
+  sudah bisa hidup tanpa TUI dan dikendalikan lewat `mydns control`, tetapi
+  instalasi service butuh hak administrator dan belum diuji di mesin tanpa
+  admin, jadi belum disediakan. Tanpa admin, daemon tetap melayani proxy namun
+  DNS adapter tidak diubah.
 
 ## Struktur
 
@@ -289,7 +393,9 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
 | `src/main.rs` | CLI, elevasi UAC, subperintah |
 | `src/providers.rs` | katalog resolver, `resolvers.txt`, endpoint DoQ/DoH, IP bootstrap |
 | `src/engine.rs` | klien DoQ (quinn), DoH3 (h3), DoH2 (h2), rantai fallback |
+| `src/warp.rs` | registrasi WARP, mTLS + pinning SPKI, tunnel CONNECT-IP, paket IPv4/UDP |
 | `src/server.rs` | listener UDP/TCP di loopback, cache TTL, truncation |
+| `src/daemon.rs` | mode tanpa TUI, named pipe `\\.\pipe\mydns-daemon`, status/restore/stop |
 | `src/ui.rs` | TUI ratatui + alur terapkan/pulihkan |
 | `src/win.rs` | deteksi adapter, `Set-DnsClientServerAddress`, state file, watchdog, autostart |
-| `src/log.rs` | buffer log internal |
+| `src/log.rs` | buffer log internal, log berkas, timestamp UTC |

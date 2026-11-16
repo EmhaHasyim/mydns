@@ -324,7 +324,11 @@ fn now_secs() -> u64 {
 /// Arahkan DNS semua adapter aktif ke proxy lokal kita.
 /// DNS asli dicatat lebih dulu; pencatatan lama tidak ditimpa supaya
 /// mengklik provider dua kali tidak menghapus setelan asli.
-pub fn apply(provider_id: &str) -> Result<Vec<Adapter>, String> {
+///
+/// `listen_v6` menandakan proxy benar-benar punya listener di `[::1]:53`.
+/// Kalau tidak, `::1` tidak dipasang: DNS IPv6 yang menunjuk port mati akan
+/// memutus resolusi IPv6 tanpa alasan.
+pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String> {
     require_admin()?;
     let adapters = list_adapters()?;
     if adapters.is_empty() {
@@ -352,10 +356,12 @@ pub fn apply(provider_id: &str) -> Result<Vec<Adapter>, String> {
             "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '127.0.0.1' -ErrorAction Stop; $ok += '{}' }} catch {{ $bad += \"{}: $($_.Exception.Message)\" }}\n",
             a.index, a.index, a.index
         ));
-        script.push_str(&format!(
-            "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '::1' -ErrorAction Stop }} catch {{ }}\n",
-            a.index
-        ));
+        if listen_v6 {
+            script.push_str(&format!(
+                "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '::1' -ErrorAction Stop }} catch {{ }}\n",
+                a.index
+            ));
+        }
     }
     script.push_str("@{ok=$ok; bad=$bad} | ConvertTo-Json -Compress\n");
 
@@ -378,18 +384,32 @@ pub fn apply(provider_id: &str) -> Result<Vec<Adapter>, String> {
     Ok(adapters)
 }
 
-/// Kembalikan DNS ke kondisi asli (DHCP atau server statis sebelumnya).
-pub fn restore() -> Result<String, String> {
-    require_admin()?;
-    let saved = load_state();
-    let adapters = list_adapters()?;
-
+/// Rakit skrip PowerShell untuk mengembalikan DNS, tanpa menjalankannya.
+///
+/// Index adapter bisa berubah setelah reboot atau reinstall driver, jadi nama
+/// adapter dipakai sebagai cadangan: kalau index lama sudah tidak ada, adapter
+/// dengan nama yang sama tetap dipulihkan. Adapter yang benar-benar hilang
+/// dilewati, bukan dipaksa ke index yang sekarang mungkin milik adapter lain.
+fn restore_plan(saved: Option<&Saved>, adapters: &[Adapter]) -> (String, usize) {
     let mut script = String::new();
     let mut touched = 0usize;
 
-    match &saved {
+    match saved {
         Some(s) if !s.ifaces.is_empty() => {
-            for (index, iface) in &s.ifaces {
+            let by_index: BTreeMap<u32, &Adapter> = adapters.iter().map(|a| (a.index, a)).collect();
+            let by_name: BTreeMap<&str, u32> = adapters
+                .iter()
+                .map(|a| (a.name.as_str(), a.index))
+                .collect();
+
+            for (saved_index, iface) in &s.ifaces {
+                let index = saved_index
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|index| by_index.contains_key(index))
+                    .or_else(|| by_name.get(iface.name.as_str()).copied());
+                let Some(index) = index else { continue };
+
                 let has_v4 = !iface.v4.is_empty();
                 let has_v6 = !iface.v6.is_empty();
                 // Reset ke DHCP hanya perlu kalau aslinya memang DHCP, atau kalau
@@ -418,7 +438,7 @@ pub fn restore() -> Result<String, String> {
         }
         _ => {
             // Tidak ada catatan: reset semua adapter yang masih menunjuk loopback.
-            for a in &adapters {
+            for a in adapters {
                 if a.v4.iter().any(|s| s == "127.0.0.1") || a.v6.iter().any(|s| s == "::1") {
                     script.push_str(&format!(
                         "Set-DnsClientServerAddress -InterfaceIndex {} -ResetServerAddresses -ErrorAction SilentlyContinue\n",
@@ -430,6 +450,16 @@ pub fn restore() -> Result<String, String> {
             script.push_str("'ok'\n");
         }
     }
+
+    (script, touched)
+}
+
+/// Kembalikan DNS ke kondisi asli (DHCP atau server statis sebelumnya).
+pub fn restore() -> Result<String, String> {
+    require_admin()?;
+    let saved = load_state();
+    let adapters = list_adapters()?;
+    let (script, touched) = restore_plan(saved.as_ref(), &adapters);
 
     if touched == 0 {
         clear_state();
@@ -463,6 +493,16 @@ pub fn port53_free() -> bool {
     };
     drop(udp);
     std::net::TcpListener::bind("127.0.0.1:53").is_ok()
+}
+
+/// Sama untuk loopback IPv6; dipakai `doctor` supaya konflik port terlihat
+/// sebelum adapter diarahkan ke `::1`.
+pub fn port53_v6_free() -> bool {
+    let Ok(udp) = std::net::UdpSocket::bind("[::1]:53") else {
+        return false;
+    };
+    drop(udp);
+    std::net::TcpListener::bind("[::1]:53").is_ok()
 }
 
 /// Pulihkan hanya kalau catatan masih ada **dan** tidak ada yang melayani
@@ -739,4 +779,73 @@ pub fn relaunch_elevated(args: &[String]) -> Result<(), String> {
         return Err("UAC dibatalkan atau gagal menaikkan hak akses".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter(index: u32, name: &str, v4: &[&str], v6: &[&str]) -> Adapter {
+        Adapter {
+            index,
+            name: name.to_string(),
+            v4: v4.iter().map(|ip| ip.to_string()).collect(),
+            v6: v6.iter().map(|ip| ip.to_string()).collect(),
+        }
+    }
+
+    fn saved(index: &str, name: &str, v4: &[&str]) -> Saved {
+        let mut ifaces = BTreeMap::new();
+        ifaces.insert(
+            index.to_string(),
+            SavedIface {
+                name: name.to_string(),
+                v4: v4.iter().map(|ip| ip.to_string()).collect(),
+                v6: Vec::new(),
+            },
+        );
+        Saved {
+            provider: "quad9".to_string(),
+            saved_at: 0,
+            ifaces,
+        }
+    }
+
+    #[test]
+    fn restore_memakai_nama_saat_index_berubah() {
+        let saved = saved("99", "Ethernet", &["9.9.9.9"]);
+        let adapters = vec![adapter(5, "Ethernet", &["127.0.0.1"], &[])];
+
+        let (script, touched) = restore_plan(Some(&saved), &adapters);
+
+        assert_eq!(touched, 1);
+        assert!(script.contains("-InterfaceIndex 5"), "{script}");
+        assert!(!script.contains("99"), "{script}");
+        assert!(script.contains("'9.9.9.9'"), "{script}");
+    }
+
+    #[test]
+    fn restore_melewati_adapter_yang_sudah_hilang() {
+        let saved = saved("99", "Ethernet", &["9.9.9.9"]);
+        let adapters = vec![adapter(5, "Wi-Fi", &["127.0.0.1"], &[])];
+
+        let (script, touched) = restore_plan(Some(&saved), &adapters);
+
+        assert_eq!(touched, 0);
+        assert!(!script.contains("-InterfaceIndex"), "{script}");
+    }
+
+    #[test]
+    fn restore_tanpa_catatan_mereset_loopback() {
+        let adapters = vec![
+            adapter(5, "Wi-Fi", &["127.0.0.1"], &["::1"]),
+            adapter(7, "Ethernet", &["9.9.9.9"], &[]),
+        ];
+
+        let (script, touched) = restore_plan(None, &adapters);
+
+        assert_eq!(touched, 1);
+        assert!(script.contains("-InterfaceIndex 5"), "{script}");
+        assert!(!script.contains("-InterfaceIndex 7"), "{script}");
+    }
 }

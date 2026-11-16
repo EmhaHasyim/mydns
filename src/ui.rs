@@ -136,6 +136,9 @@ pub struct App {
     hits: u64,
     misses: u64,
     tick: u64,
+    /// Latensi beberapa query terakhir per provider (maks 20), untuk p50 di
+    /// panel detail.
+    latencies: Vec<Vec<u128>>,
 }
 
 fn item_count() -> usize {
@@ -268,6 +271,19 @@ impl App {
                     ms
                 );
                 self.dns_now = format!("{adapters} adapter → 127.0.0.1  ·  proxy lokal :53");
+                if let Some(samples) = self.latencies.get_mut(index) {
+                    samples.push(ms);
+                    if samples.len() > 20 {
+                        samples.remove(0);
+                    }
+                }
+                crate::log::event(&format!(
+                    "aktif: {} lewat {} ({} ms, {} adapter)",
+                    providers()[index].name,
+                    proto.label(),
+                    ms,
+                    adapters
+                ));
             }
             Msg::Cleared(text) => {
                 self.idle();
@@ -275,12 +291,14 @@ impl App {
                 self.hits = 0;
                 self.misses = 0;
                 self.dns_now = "setelan DNS asli dipulihkan".to_string();
+                crate::log::event(&format!("restore: {text}"));
                 self.status = text;
             }
             Msg::Failed(error) => {
                 self.idle();
                 self.is_error = true;
                 self.active = None;
+                crate::log::event(&format!("gagal: {error}"));
                 self.status = error;
             }
             Msg::Stats { hits, misses } => {
@@ -465,10 +483,60 @@ impl App {
         frame.render_widget(detail, area);
     }
 
+    /// Ringkasan latensi query terakhir untuk satu provider.
+    fn latency_summary(&self, index: usize) -> Option<String> {
+        let samples = self.latencies.get(index)?;
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        Some(format!("p50 {p50} ms · {} query", samples.len()))
+    }
+
     fn detail_lines(&self) -> Vec<Line<'static>> {
         let Some(provider) = providers().get(self.cursor) else {
             return self.clear_detail_lines();
         };
+
+        // WARP tidak punya endpoint DoQ/DoH statis, jadi panel detailnya
+        // menampilkan status perangkat, bukan URL resolver.
+        if provider.warp {
+            let mut lines = vec![
+                text(provider.name, bold(ACCENT)),
+                text(provider.note, fg(MUTED)),
+                Line::default(),
+                text("MASQUE  ·  CONNECT-IP", bold(ACCENT_DIM)),
+                text("HTTP/3 + QUIC datagram", fg(TEXT)),
+                Line::default(),
+                heading("PERANGKAT"),
+            ];
+            match crate::warp::load() {
+                Ok(config) => {
+                    lines.push(text(config.device_id.clone(), fg(TEXT)));
+                    lines.push(text(config.endpoint_v4, fg(MUTED)));
+                }
+                Err(_) => lines.push(text(
+                    "belum terdaftar — jalankan `mydns warp register`",
+                    fg(WARN),
+                )),
+            }
+            if let Some(active) = self.active.as_ref().filter(|a| a.index == self.cursor) {
+                lines.push(Line::default());
+                lines.push(Line::from(vec![
+                    Span::styled("● aktif ", fg(OK)),
+                    Span::styled(
+                        format!("· {} · {} ms", active.proto.label(), active.ms),
+                        fg(MUTED),
+                    ),
+                ]));
+                if let Some(summary) = self.latency_summary(active.index) {
+                    lines.push(text(summary, fg(MUTED)));
+                }
+            }
+            return lines;
+        }
 
         // Judul memakai port yang benar-benar dipakai provider, supaya resolver
         // kustom dengan port lain tidak ditampilkan seolah-olah 853.
@@ -721,6 +789,8 @@ async fn apply_flow(
         }
     };
 
+    // Hanya pasang `::1` sebagai DNS kalau listener IPv6 benar-benar terikat.
+    let listen_v6 = bound.v6;
     let (stop_tx, _) = watch::channel(false);
     let proxy = bound.proxy.clone();
     let stop_rx = stop_tx.subscribe();
@@ -760,7 +830,7 @@ async fn apply_flow(
 
     // 4. Baru arahkan adapter ke loopback.
     let id = provider.id;
-    let applied = tokio::task::spawn_blocking(move || win::apply(id)).await;
+    let applied = tokio::task::spawn_blocking(move || win::apply(id, listen_v6)).await;
     let adapters = match applied {
         Ok(Ok(adapters)) => adapters,
         Ok(Err(e)) => {
@@ -828,6 +898,7 @@ async fn apply_flow(
     let mut drift_stop = stop_tx.subscribe();
     let drift_tx = tx.clone();
     let drift_id = provider.id;
+    let drift_v6 = listen_v6;
     let drift_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3));
         let mut last_failure: Option<Instant> = None;
@@ -846,7 +917,8 @@ async fn apply_flow(
                     if !matches!(drifted, Ok(true)) {
                         continue;
                     }
-                    let applied = tokio::task::spawn_blocking(move || win::apply(drift_id)).await;
+                    let applied =
+                        tokio::task::spawn_blocking(move || win::apply(drift_id, drift_v6)).await;
                     match applied {
                         Ok(Ok(_)) => {
                             last_failure = None;
@@ -903,6 +975,7 @@ pub fn run(
         hits: 0,
         misses: 0,
         tick: 0,
+        latencies: vec![Vec::new(); providers().len()],
     };
 
     // Baca DNS aktif di latar belakang supaya frame pertama tidak tertahan.
