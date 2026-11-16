@@ -205,7 +205,9 @@ impl Engine {
         if let Some(tunnel) = slot.as_ref() {
             return Ok(tunnel.clone());
         }
-        let config = crate::warp::load()?;
+        // `ensure` mendaftarkan perangkat sendiri kalau belum ada, jadi
+        // memilih provider WARP tidak memerlukan perintah tambahan.
+        let config = crate::warp::ensure().await?;
         let tunnel = crate::warp::Tunnel::connect(&config).await?;
         *slot = Some(tunnel.clone());
         Ok(tunnel)

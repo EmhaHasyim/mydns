@@ -91,12 +91,8 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> Result<Config, String> {
     let path = config_path();
-    let raw = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "belum terdaftar ({}): {e} — jalankan `mydns warp register`",
-            path.display()
-        )
-    })?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("belum terdaftar ({}): {e}", path.display()))?;
     let mut config: Config =
         serde_json::from_str(&raw).map_err(|e| format!("{} rusak: {e}", path.display()))?;
     if config.protected {
@@ -105,6 +101,25 @@ pub fn load() -> Result<Config, String> {
         // ulang kalau nilainya ditulis kembali.
         config.protected = false;
     }
+    Ok(config)
+}
+
+/// Konfigurasi siap pakai: pakai yang tersimpan, atau daftarkan perangkat
+/// baru otomatis lalu simpan. Inilah jalur yang dipakai runtime, sehingga
+/// memilih "Cloudflare WARP" sudah cukup — pengguna tidak perlu tahu ada
+/// langkah registrasi. Berkas yang ada tetapi rusak tidak ditimpa: lebih baik
+/// melaporkan errornya daripada diam-diam membuat perangkat baru.
+pub async fn ensure() -> Result<Config, String> {
+    let path = config_path();
+    if path.exists() {
+        return load();
+    }
+    let config = register().await?;
+    save(&config)?;
+    crate::log::event(&format!(
+        "warp: perangkat didaftarkan otomatis ({})",
+        config.device_id
+    ));
     Ok(config)
 }
 

@@ -517,10 +517,7 @@ impl App {
                     lines.push(text(config.device_id.clone(), fg(TEXT)));
                     lines.push(text(config.endpoint_v4, fg(MUTED)));
                 }
-                Err(_) => lines.push(text(
-                    "belum terdaftar — jalankan `mydns warp register`",
-                    fg(WARN),
-                )),
+                Err(_) => lines.push(text("didaftarkan otomatis saat WARP dipakai", fg(MUTED))),
             }
             if let Some(active) = self.active.as_ref().filter(|a| a.index == self.cursor) {
                 lines.push(Line::default());

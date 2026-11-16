@@ -133,7 +133,7 @@ di TUI yang mudah dipakai:
 | `mydns control status` | tanya daemon: provider, uptime, cache, query diteruskan |
 | `mydns control restore` | minta daemon memulihkan DNS tanpa berhenti |
 | `mydns control stop` | hentikan daemon (DNS dipulihkan dulu) |
-| `mydns warp register` | daftarkan perangkat Cloudflare WARP (sekali saja) |
+| `mydns warp register` | buat ulang perangkat WARP (normalnya otomatis) |
 | `mydns warp status` | tampilkan data perangkat WARP yang tersimpan |
 | `mydns warp test` | buka tunnel WARP dan uji satu query DNS |
 
@@ -253,16 +253,16 @@ Resolver kelima: query DNS dikirim **di dalam tunnel MASQUE Cloudflare WARP**
 hanya query DNS — tidak ada adapter TUN dan tidak ada route yang diubah, jadi
 sisa trafik tetap memakai koneksi biasa.
 
-Sekali saja, daftarkan perangkat:
+**Tidak ada langkah pendaftaran yang perlu diketahui.** Pilih baris
+**WARP (MASQUE)** di TUI seperti resolver lain; saat pertama kali dipakai,
+MyDNS mendaftarkan perangkat sendiri ke API Cloudflare (buat perangkat
+WireGuard, lalu tukar kuncinya ke kunci P-256 untuk mode MASQUE) dan menyimpan
+hasilnya di `%APPDATA%\MyDns\warp.json`. Pilihan itu sekaligus menjadi saklar
+"pakai VPN WARP atau tidak": resolver lain berjalan tanpa WARP.
 
-```powershell
-mydns warp register
-```
-
-Perintah itu memanggil API Cloudflare (buat perangkat WireGuard, lalu tukar
-kuncinya ke kunci P-256 untuk mode MASQUE) dan menyimpan hasilnya di
-`%APPDATA%\MyDns\warp.json`. Sesudah itu baris **WARP (MASQUE)** di TUI bisa
-dipilih seperti resolver lain.
+Pendaftaran otomatis hanya terjadi sekali. Kalau berkasnya rusak, MyDNS
+melaporkan errornya dan tidak menimpa perangkat lama diam-diam; `mydns warp
+register` tetap ada untuk membuat perangkat baru dari awal.
 
 Periksa dan uji kapan saja:
 
@@ -292,7 +292,7 @@ Yang perlu diketahui:
 - `warp.json` berisi kunci privat perangkat, tetapi disimpan **terenkripsi
   DPAPI** sehingga hanya user Windows yang sama di mesin ini yang bisa
   membukanya. Berkas lama berisi base64 biasa tetap dibaca, lalu dienkripsi saat
-  disimpan lagi. `mydns warp register` ulang akan membuat perangkat baru.
+  disimpan lagi.
 
 ## Tes
 

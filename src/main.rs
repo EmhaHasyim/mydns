@@ -439,7 +439,8 @@ fn cmd_warp(mode: &str) {
                     println!("  tunnel IP : {}", config.ipv4);
                     println!("  berkas    : {}", warp::config_path().display());
                     println!(
-                        "\nPilih \"Cloudflare WARP\" di TUI, atau cek dulu dengan `mydns warp test`."
+                        "\nPilih \"Cloudflare WARP\" di TUI. Perangkat ini juga dibuat\n\n \
+                         otomatis saat WARP pertama kali dipakai."
                     );
                 }
                 Err(e) => {
@@ -460,12 +461,17 @@ fn cmd_warp(mode: &str) {
                 println!("  SNI       : {}", config.sni);
                 println!("  berkas    : {}", warp::config_path().display());
             }
-            Err(e) => println!("WARP belum siap: {e}"),
+            Err(_) => println!(
+                "WARP belum terdaftar — perangkat dibuat otomatis saat \"Cloudflare WARP\" dipilih atau `mydns warp test` dijalankan."
+            ),
         },
         "test" | "uji" => {
             let rt = runtime();
             let outcome: Result<(), String> = rt.block_on(async {
-                let config = warp::load()?;
+                if !warp::config_path().exists() {
+                    println!("Perangkat WARP belum ada — mendaftar otomatis…");
+                }
+                let config = warp::ensure().await?;
                 let started = Instant::now();
                 let tunnel = warp::Tunnel::connect(&config).await?;
                 println!(
@@ -580,7 +586,7 @@ PEMAKAIAN
   mydns serve <id>      jalankan proxy saja tanpa TUI (untuk debug)
   mydns daemon [id]     proxy tanpa TUI + kontrol lewat named pipe
   mydns control <cmd>   status / restore / stop untuk daemon yang berjalan
-  mydns warp register   daftarkan perangkat Cloudflare WARP (mode MASQUE)
+  mydns warp register   buat ulang perangkat WARP (normalnya otomatis)
   mydns warp status     tampilkan data perangkat WARP yang tersimpan
   mydns warp test       buka tunnel WARP dan uji satu query DNS
   mydns help            pesan ini
