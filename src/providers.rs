@@ -22,6 +22,8 @@ pub enum Proto {
     DoH3,
     /// DNS over HTTPS di atas HTTP/2 (jalur fallback terakhir).
     DoH2,
+    /// Query DNS dibawa tunnel Cloudflare WARP (MASQUE / CONNECT-IP).
+    Warp,
 }
 
 impl Proto {
@@ -30,6 +32,7 @@ impl Proto {
             Proto::DoQ => "DoQ",
             Proto::DoH3 => "DoH3",
             Proto::DoH2 => "DoH2",
+            Proto::Warp => "WARP",
         }
     }
 }
@@ -45,6 +48,8 @@ pub struct Provider {
     pub doh: Option<&'static str>,
     /// IP unicast yang dipakai sebagai tujuan koneksi (SNI tetap hostname).
     pub boot: &'static [&'static str],
+    /// Resolver ini diakses lewat tunnel MASQUE, bukan DoQ/DoH langsung.
+    pub warp: bool,
 }
 
 impl Provider {
@@ -58,6 +63,9 @@ impl Provider {
             v.push(Proto::DoH3);
             v.push(Proto::DoH2);
         }
+        if self.warp {
+            v.push(Proto::Warp);
+        }
         v
     }
 
@@ -65,7 +73,7 @@ impl Provider {
     pub fn quic_protos(&self) -> Vec<Proto> {
         self.protos()
             .into_iter()
-            .filter(|p| matches!(p, Proto::DoQ | Proto::DoH3))
+            .filter(|p| matches!(p, Proto::DoQ | Proto::DoH3 | Proto::Warp))
             .collect()
     }
 
@@ -88,6 +96,7 @@ const BUILTINS: &[Provider] = &[
         doq: None,
         doh: Some("https://cloudflare-dns.com/dns-query"),
         boot: &["1.1.1.1", "1.0.0.1"],
+        warp: false,
     },
     Provider {
         id: "quad9",
@@ -96,6 +105,7 @@ const BUILTINS: &[Provider] = &[
         doq: Some(("dns.quad9.net", 853)),
         doh: Some("https://dns.quad9.net/dns-query"),
         boot: &["9.9.9.9", "149.112.112.112"],
+        warp: false,
     },
     Provider {
         id: "adguard",
@@ -104,6 +114,7 @@ const BUILTINS: &[Provider] = &[
         doq: Some(("dns.adguard-dns.com", 853)),
         doh: Some("https://dns.adguard-dns.com/dns-query"),
         boot: &["94.140.14.14", "94.140.15.15"],
+        warp: false,
     },
     Provider {
         id: "controld",
@@ -115,6 +126,17 @@ const BUILTINS: &[Provider] = &[
         // hostname ini (terlihat dari hasil resolusi x-hagezi-ultimate...).
         // Dua IP lain tetap disimpan sebagai cadangan jaringan lain.
         boot: &["76.76.2.11", "76.76.2.45", "76.76.10.45"],
+        warp: false,
+    },
+    Provider {
+        id: "warp",
+        name: "Cloudflare WARP",
+        note: "MASQUE, query DNS di dalam tunnel",
+        doq: None,
+        doh: None,
+        // Endpoint WARP datang dari hasil registrasi, bukan dari katalog.
+        boot: &[],
+        warp: true,
     },
 ];
 
@@ -297,6 +319,7 @@ impl Entry {
             doq: self.doq.map(|(host, port)| (leak(host), port)),
             doh: self.doh.map(leak),
             boot: leak_boot(self.boot),
+            warp: false,
         }
     }
 }
@@ -381,7 +404,9 @@ mod tests {
         assert!(ids.starts_with(&["cloudflare", "quad9", "adguard", "controld"]));
         assert!(list.iter().all(|p| !p.protos().is_empty()));
         // Setiap provider harus punya IP bootstrap: tanpa itu koneksi akan
-        // memutar balik ke proxy sendiri.
-        assert!(list.iter().all(|p| !p.boot.is_empty()));
+        // memutar balik ke proxy sendiri. Pengecualian: WARP, yang endpoint-nya
+        // baru diketahui setelah registrasi.
+        assert!(list.iter().all(|p| !p.boot.is_empty() || p.warp));
+        assert!(list.iter().any(|p| p.warp), "provider WARP harus ada");
     }
 }

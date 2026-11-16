@@ -6,11 +6,11 @@
 
 use crate::engine::{Engine, build_query, describe};
 use crate::log::Log;
-use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::RecordType;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -29,6 +29,13 @@ struct Key {
     name: String,
     qtype: u16,
     qclass: u16,
+    /// DO bit: jawaban DNSSEC (RRSIG) hanya boleh dilayani ke klien yang
+    /// memintanya. Tanpa pemisahan ini, klien yang meminta DNSSEC bisa
+    /// menerima jawaban tanpa RRSIG sehingga validasinya gagal.
+    dnssec_ok: bool,
+    /// CD bit: klien yang mematikan pemeriksaan bisa menerima data berbeda
+    /// dari klien biasa, jadi tidak boleh berbagi entri cache.
+    checking_disabled: bool,
 }
 
 struct Entry {
@@ -37,8 +44,9 @@ struct Entry {
 }
 
 /// Kunci cache: nama tanpa titik akhir dan tanpa beda huruf besar/kecil,
-/// supaya `Example.COM.` dan `example.com` tidak disimpan sebagai dua entri.
-fn cache_key(question: &hickory_proto::op::Query) -> Key {
+/// supaya `Example.COM.` dan `example.com` tidak disimpan sebagai dua entri,
+/// ditambah bit yang mengubah isi jawaban (DO dan CD).
+fn cache_key(question: &hickory_proto::op::Query, message: &Message) -> Key {
     Key {
         name: question
             .name()
@@ -47,13 +55,36 @@ fn cache_key(question: &hickory_proto::op::Query) -> Key {
             .to_lowercase(),
         qtype: u16::from(question.query_type()),
         qclass: u16::from(question.query_class()),
+        dnssec_ok: message
+            .edns
+            .as_ref()
+            .is_some_and(|edns| edns.flags().dnssec_ok),
+        checking_disabled: message.metadata.checking_disabled,
     }
+}
+
+/// Hanya query DNS biasa yang boleh masuk cache. Opcode lain (UPDATE, NOTIFY),
+/// transfer zona, TSIG, dan query yang membawa opsi EDNS (COOKIE, ECS, …)
+/// jawabannya bergantung pada pengirim atau izin, jadi tidak boleh dibagikan.
+fn is_cacheable(message: &Message, question: &hickory_proto::op::Query) -> bool {
+    message.metadata.op_code == OpCode::Query
+        && message.queries.len() == 1
+        && message.signature.is_none()
+        && !matches!(question.query_type(), RecordType::AXFR | RecordType::IXFR)
+        && message
+            .edns
+            .as_ref()
+            .is_none_or(|edns| edns.options().options.is_empty())
 }
 
 pub struct Proxy {
     engine: Arc<Engine>,
     log: Arc<Log>,
     cache: Mutex<HashMap<Key, Entry>>,
+    /// Gerbang per kunci untuk menggabungkan query identik yang datang
+    /// bersamaan. Hanya `Weak` yang disimpan: entri hilang sendiri begitu
+    /// tidak ada query yang memegangnya.
+    inflight: Mutex<HashMap<Key, Weak<Mutex<()>>>>,
     hits: AtomicU64,
     misses: AtomicU64,
     forwards: AtomicU64,
@@ -65,6 +96,7 @@ impl Proxy {
             engine,
             log,
             cache: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             forwards: AtomicU64::new(0),
@@ -104,78 +136,154 @@ impl Proxy {
         let Some(question) = parsed.queries.first() else {
             return Some(servfail(request));
         };
-        let key = cache_key(question);
+        let key = cache_key(question, &parsed);
+        let name = key.name.clone();
+        let qtype = question.query_type();
+        let cacheable = is_cacheable(&parsed, question);
 
-        // Hanya query biasa (bukan AXFR/dynamic update) yang kita cache.
-        let cacheable = parsed.queries.len() == 1
-            && !matches!(question.query_type(), RecordType::AXFR | RecordType::IXFR);
-
-        if cacheable {
-            let cache = self.cache.lock().await;
-            if let Some(entry) = cache.get(&key)
-                && entry.expires > Instant::now()
-            {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                let mut bytes = entry.bytes.clone();
-                bytes[0] = id[0];
-                bytes[1] = id[1];
-                drop(cache);
-                self.log_query(&key.name, question.query_type(), "cache", 0);
-                return Some(fit_udp(bytes, &parsed, over_tcp));
-            }
+        if cacheable && let Some((bytes, remaining)) = self.cache_get(&key).await {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.log_query(&name, qtype, "cache", 0);
+            return Some(fit_udp(
+                cached_response(&bytes, id, remaining),
+                &parsed,
+                over_tcp,
+            ));
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
-        self.forwards.fetch_add(1, Ordering::Relaxed);
 
-        let started = Instant::now();
-        let response = match self.engine.resolve(request).await {
-            Ok((resp, proto)) => {
-                self.log_query(
-                    &key.name,
-                    question.query_type(),
-                    proto.label(),
-                    started.elapsed().as_millis(),
-                );
-                resp
-            }
-            Err(e) => {
-                self.log.push(format!(
-                    "gagal meneruskan {} ({:?}): {}",
-                    key.name,
-                    question.query_type(),
-                    e
-                ));
-                return Some(servfail(request));
-            }
-        };
-
-        if cacheable && let Ok(resp_msg) = Message::from_vec(&response) {
-            let ttl = resp_msg.answers.iter().map(|r| r.ttl).min().unwrap_or(0);
-            if ttl > 0 && resp_msg.metadata.response_code == ResponseCode::NoError {
-                let lifetime = Duration::from_secs(u64::from(ttl.min(MAX_CACHE_SECS)));
-                let mut cache = self.cache.lock().await;
-                if cache.len() >= MAX_CACHE_ITEMS {
-                    // Buang yang sudah kedaluwarsa lebih dulu; kosongkan semua
-                    // hanya kalau entri yang tersisa memang masih segar semua.
-                    let now = Instant::now();
-                    cache.retain(|_, entry| entry.expires > now);
-                    if cache.len() >= MAX_CACHE_ITEMS {
-                        cache.clear();
-                    }
-                }
-                cache.insert(
-                    key,
-                    Entry {
-                        bytes: response.clone(),
-                        expires: Instant::now() + lifetime,
-                    },
-                );
-            }
+        if !cacheable {
+            let response = self.forward(request, &key, &name, qtype).await;
+            return Some(fit_udp(response, &parsed, over_tcp));
         }
 
+        // Query identik yang datang bersamaan cukup diteruskan sekali. Yang
+        // lain menunggu gerbang ini lalu mengambil hasilnya dari cache.
+        let gate = self.join_flight(&key).await;
+        let response = {
+            let _guard = Arc::clone(&gate).lock_owned().await;
+            match self.cache_get(&key).await {
+                Some((bytes, remaining)) => {
+                    self.log_query(&name, qtype, "gabung", 0);
+                    cached_response(&bytes, id, remaining)
+                }
+                None => self.forward(request, &key, &name, qtype).await,
+            }
+        };
+        self.leave_flight(&key, &gate).await;
         Some(fit_udp(response, &parsed, over_tcp))
     }
+
+    /// Teruskan query ke upstream, catat log, dan simpan hasilnya di cache.
+    async fn forward(&self, request: &[u8], key: &Key, name: &str, qtype: RecordType) -> Vec<u8> {
+        self.forwards.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        match self.engine.resolve(request).await {
+            Ok((response, proto)) => {
+                self.log_query(name, qtype, proto.label(), started.elapsed().as_millis());
+                self.store_cache(key, &response).await;
+                response
+            }
+            Err(e) => {
+                self.log
+                    .push(format!("gagal meneruskan {name} ({qtype:?}): {e}"));
+                servfail(request)
+            }
+        }
+    }
+
+    /// Ambil entri cache yang masih hidup beserta sisa umurnya dalam detik.
+    /// Sisa umur dipakai untuk menurunkan TTL yang dikirim ke klien, supaya
+    /// klien tidak menyimpan rekaman lebih lama daripada cache kita.
+    async fn cache_get(&self, key: &Key) -> Option<(Vec<u8>, u32)> {
+        let cache = self.cache.lock().await;
+        let entry = cache.get(key)?;
+        let left = entry.expires.checked_duration_since(Instant::now())?;
+        let remaining = u32::try_from(left.as_millis().div_ceil(1000))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        Some((entry.bytes.clone(), remaining))
+    }
+
+    async fn store_cache(&self, key: &Key, response: &[u8]) {
+        let Ok(message) = Message::from_vec(response) else {
+            return;
+        };
+        let ttl = message.answers.iter().map(|r| r.ttl).min().unwrap_or(0);
+        if ttl == 0 || message.metadata.response_code != ResponseCode::NoError {
+            return;
+        }
+        let lifetime = Duration::from_secs(u64::from(ttl.min(MAX_CACHE_SECS)));
+        let mut cache = self.cache.lock().await;
+        if cache.len() >= MAX_CACHE_ITEMS {
+            // Buang yang sudah kedaluwarsa lebih dulu; kosongkan semua
+            // hanya kalau entri yang tersisa memang masih segar semua.
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires > now);
+            if cache.len() >= MAX_CACHE_ITEMS {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key.clone(),
+            Entry {
+                bytes: response.to_vec(),
+                expires: Instant::now() + lifetime,
+            },
+        );
+    }
+
+    /// Gerbang untuk satu kunci. Yang pertama membuat gerbang baru; yang lain
+    /// memakai gerbang yang sama sehingga query-nya tidak ikut diteruskan.
+    async fn join_flight(&self, key: &Key) -> Arc<Mutex<()>> {
+        let mut map = self.inflight.lock().await;
+        if let Some(gate) = map.get(key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        map.insert(key.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    /// Hapus entri gerbang kalau tidak ada lagi query yang memegangnya.
+    /// Waiter terakhir yang membersihkan, jadi map tidak tumbuh tanpa batas
+    /// walau ribuan nama berbeda pernah di-query.
+    async fn leave_flight(&self, key: &Key, gate: &Arc<Mutex<()>>) {
+        let mut map = self.inflight.lock().await;
+        let ours = map
+            .get(key)
+            .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(gate)));
+        if ours && Arc::strong_count(gate) == 1 {
+            map.remove(key);
+        }
+    }
+}
+
+/// Siapkan jawaban cache untuk klien tertentu: ID query klien dipasang kembali
+/// dan TTL semua record diturunkan ke sisa umur cache (RFC 2181 §5.3), supaya
+/// klien tidak menyimpan rekaman lebih lama daripada yang kita anggap segar.
+fn cached_response(bytes: &[u8], id: [u8; 2], remaining: u32) -> Vec<u8> {
+    let mut out = match Message::from_vec(bytes) {
+        Ok(mut message) => {
+            for record in &mut message.answers {
+                record.ttl = record.ttl.min(remaining);
+            }
+            for record in &mut message.authorities {
+                record.ttl = record.ttl.min(remaining);
+            }
+            for record in &mut message.additionals {
+                record.ttl = record.ttl.min(remaining);
+            }
+            message.to_vec().unwrap_or_else(|_| bytes.to_vec())
+        }
+        Err(_) => bytes.to_vec(),
+    };
+    if out.len() >= 2 {
+        out[0] = id[0];
+        out[1] = id[1];
+    }
+    out
 }
 
 /// Jawaban yang tidak dibungkus dalam batas payload UDP klien harus dipotong
@@ -253,6 +361,9 @@ pub async fn probe() -> Result<String, String> {
 /// Socket yang sudah terikat, siap dijalankan.
 pub struct Bound {
     pub proxy: Arc<Proxy>,
+    /// True kalau listener `[::1]:53` benar-benar aktif. Dipakai sebelum
+    /// memasang `::1` sebagai DNS adapter.
+    pub v6: bool,
     v4_udp: Arc<UdpSocket>,
     v4_tcp: Arc<TcpListener>,
     v6_udp: Option<Arc<UdpSocket>>,
@@ -275,9 +386,11 @@ pub async fn bind(engine: Arc<Engine>, log: Arc<Log>) -> Result<Bound, String> {
         log.push("listener IPv6 aktif di [::1]:53");
     });
     let v6_tcp = TcpListener::bind(ADDR_V6).await.ok();
+    let v6 = v6_udp.is_some() && v6_tcp.is_some();
 
     Ok(Bound {
         proxy,
+        v6,
         v4_udp: Arc::new(v4_udp),
         v4_tcp: Arc::new(v4_tcp),
         v6_udp: v6_udp.map(Arc::new),
@@ -422,11 +535,63 @@ mod tests {
     fn cache_key_menormalkan_nama() {
         let upper = Message::from_vec(&build_query("Example.COM.")).unwrap();
         let lower = Message::from_vec(&build_query("example.com")).unwrap();
-        let a = cache_key(upper.queries.first().unwrap());
-        let b = cache_key(lower.queries.first().unwrap());
+        let a = cache_key(upper.queries.first().unwrap(), &upper);
+        let b = cache_key(lower.queries.first().unwrap(), &lower);
         assert_eq!(a, b);
         assert_eq!(a.name, "example.com");
         assert_eq!(a.qtype, u16::from(RecordType::A));
+    }
+
+    #[test]
+    fn cache_key_memisahkan_dnssec_dan_cd() {
+        use hickory_proto::op::{Edns, Query};
+        use hickory_proto::rr::Name;
+
+        let plain = Message::from_vec(&build_query("example.com.")).unwrap();
+        let a = cache_key(plain.queries.first().unwrap(), &plain);
+
+        let mut signed = Message::query();
+        signed.metadata.recursion_desired = true;
+        signed.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        signed.set_edns(edns);
+        let b = cache_key(signed.queries.first().unwrap(), &signed);
+
+        assert_ne!(a, b, "DO bit harus memisahkan entri cache");
+        assert!(b.dnssec_ok);
+
+        signed.metadata.checking_disabled = true;
+        let c = cache_key(signed.queries.first().unwrap(), &signed);
+        assert_ne!(b, c, "CD bit harus memisahkan entri cache");
+    }
+
+    #[test]
+    fn cache_hit_menurunkan_ttl_dan_mengganti_id() {
+        let response = big_response();
+        let served = cached_response(&response, [0xAB, 0xCD], 7);
+        let message = Message::from_vec(&served).unwrap();
+        assert_eq!(message.metadata.id, 0xABCD);
+        assert!(
+            message.answers.iter().all(|record| record.ttl <= 7),
+            "TTL yang dikirim ke klien tidak boleh melebihi sisa umur cache"
+        );
+    }
+
+    #[test]
+    fn opcode_bukan_query_tidak_dicache() {
+        use hickory_proto::op::{MessageType, Query};
+        use hickory_proto::rr::Name;
+
+        let mut message = Message::new(0, MessageType::Query, OpCode::Update);
+        message.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        assert!(!is_cacheable(&message, message.queries.first().unwrap()));
     }
 
     #[test]

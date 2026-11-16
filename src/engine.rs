@@ -88,6 +88,8 @@ pub struct Engine {
     doq: Mutex<Option<quinn::Connection>>,
     h3: StdMutex<Option<mpsc::Sender<Job>>>,
     h2: StdMutex<Option<h2::client::SendRequest<Bytes>>>,
+    /// Tunnel WARP dibuka sekali saat pertama dipakai, lalu dipakai ulang.
+    warp: Mutex<Option<Arc<crate::warp::Tunnel>>>,
     preferred: StdMutex<Option<Proto>>,
     /// Berapa kali sebuah protokol gagal berturut-turut dan kapan terakhir.
     /// Setelah dua kali, protokol itu dilewati sementara supaya fallback tidak
@@ -105,6 +107,7 @@ impl Engine {
             doq: Mutex::new(None),
             h3: StdMutex::new(None),
             h2: StdMutex::new(None),
+            warp: Mutex::new(None),
             preferred: StdMutex::new(None),
             failures: StdMutex::new(HashMap::new()),
         }))
@@ -142,16 +145,22 @@ impl Engine {
         let mut errors = Vec::new();
         for proto in order {
             match self.query_proto(proto, query).await {
-                Ok(resp) if resp.len() >= 12 => {
+                Ok(resp) if response_matches(query, &resp) => {
                     *guard(&self.preferred) = Some(proto);
                     guard(&self.failures).remove(&proto);
                     return Ok((resp, proto));
                 }
-                // Respons kosong dan error diperlakukan sama: protokol dicatat
-                // gagal, lalu query lanjut ke protokol berikutnya.
+                // Respons kosong, respons yang tidak cocok dengan query, dan
+                // error diperlakukan sama: protokol dicatat gagal, lalu query
+                // lanjut ke protokol berikutnya. Tanpa pemeriksaan ini respons
+                // dari jalur yang salah (mis. tunnel WARP yang mencocokkan
+                // hanya lewat port) bisa diteruskan ke klien.
                 Ok(_) => {
                     self.note_failure(proto).await;
-                    errors.push(format!("{}: respons kosong", proto.label()));
+                    errors.push(format!(
+                        "{}: respons tidak cocok dengan query",
+                        proto.label()
+                    ));
                 }
                 Err(e) => {
                     self.note_failure(proto).await;
@@ -167,7 +176,26 @@ impl Engine {
             Proto::DoQ => self.doq_query(query).await,
             Proto::DoH3 => self.doh3_query(query).await,
             Proto::DoH2 => self.doh2_query(query).await,
+            Proto::Warp => self.warp_query(query).await,
         }
+    }
+
+    async fn warp_query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+        self.warp_tunnel().await?.resolve(query).await
+    }
+
+    /// Ambil tunnel WARP yang sudah terbuka, atau buka yang baru. Kunci hanya
+    /// dipegang saat mengecek/mengisi slot supaya query lain tidak ikut
+    /// menunggu selama handshake.
+    async fn warp_tunnel(&self) -> Result<Arc<crate::warp::Tunnel>, String> {
+        let mut slot = self.warp.lock().await;
+        if let Some(tunnel) = slot.as_ref() {
+            return Ok(tunnel.clone());
+        }
+        let config = crate::warp::load()?;
+        let tunnel = crate::warp::Tunnel::connect(&config).await?;
+        *slot = Some(tunnel.clone());
+        Ok(tunnel)
     }
 
     /// Putuskan koneksi protokol ini dan catat kegagalannya.
@@ -192,6 +220,9 @@ impl Engine {
                 let _ = guard(&self.h3).take();
             }
             Proto::DoH2 => self.h2_forget(),
+            Proto::Warp => {
+                *self.warp.lock().await = None;
+            }
         }
     }
 
@@ -430,6 +461,35 @@ impl Engine {
     }
 }
 
+/// Pastikan respons benar-benar menjawab query yang kita kirim: tipe pesan
+/// Response, ID sama, dan pertanyaannya identik (nama tanpa beda huruf besar/
+/// kecil, tipe, dan kelas). Tanpa ini jalur seperti WARP — yang mencocokkan
+/// jawaban hanya lewat port lokal — bisa meneruskan paket milik query lain.
+fn response_matches(query: &[u8], response: &[u8]) -> bool {
+    use hickory_proto::op::{Message, MessageType};
+
+    if response.len() < 12 {
+        return false;
+    }
+    let (Ok(query), Ok(response)) = (Message::from_vec(query), Message::from_vec(response)) else {
+        return false;
+    };
+    if response.metadata.message_type != MessageType::Response
+        || response.metadata.id != query.metadata.id
+    {
+        return false;
+    }
+    let (Some(asked), Some(answered)) = (query.queries.first(), response.queries.first()) else {
+        return false;
+    };
+    asked.query_type() == answered.query_type()
+        && asked.query_class() == answered.query_class()
+        && asked
+            .name()
+            .to_ascii()
+            .eq_ignore_ascii_case(&answered.name().to_ascii())
+}
+
 /// Ringkas bagian penting dari respons DNS untuk ditampilkan ke pengguna.
 pub fn describe(resp: &[u8]) -> String {
     use hickory_proto::op::Message;
@@ -463,6 +523,14 @@ pub fn build_query(domain: &str) -> Vec<u8> {
 
 // ---------- worker HTTP/3 ----------
 
+/// Satu worker = satu koneksi HTTP/3. Job diambil dari antrean bersama, lalu
+/// diproses berurutan di dalam worker ini (pola yang terbukti stabil untuk
+/// `h3` 0.0.8); paralelisme datang dari beberapa worker sekaligus.
+///
+/// Satu worker = satu koneksi HTTP/3, dan job di koneksi itu diproses
+/// berurutan. Paralelisme datang dari beberapa worker (`H3_MAX_CONNECTIONS`),
+/// bukan dari beberapa request di satu koneksi: `h3` 0.0.8 berhenti menerima
+/// jawaban untuk sebagian server kalau satu `SendRequest` dipakai bersamaan.
 async fn h3_worker(
     ep: quinn::Endpoint,
     cfg: quinn::ClientConfig,
@@ -470,15 +538,40 @@ async fn h3_worker(
     mut rx: mpsc::Receiver<Job>,
 ) {
     let Some(url) = prov.doh else {
-        drain(&mut rx, "provider tidak mendukung DoH").await;
         return;
     };
     let host = url_host(url).to_string();
 
+    // Koneksi dibuka sebelum job pertama diambil, lengkap dengan satu poll
+    // driver (lihat `connect_h3`). Kalau gagal, worker keluar dan receiver
+    // ikut di-drop: job yang menunggu langsung mendapat error, dan query
+    // berikutnya membuat worker/koneksi baru.
+    let Ok(mut sender) = connect_h3(&ep, &cfg, prov, &host).await else {
+        return;
+    };
+
+    while let Some((query, reply)) = rx.recv().await {
+        let result = h3_roundtrip(&mut sender, url, Bytes::from(query)).await;
+        let failed = result.is_err();
+        let _ = reply.send(result);
+        // Koneksi yang sudah error tidak dipakai lagi: worker keluar, dan
+        // koneksi pengganti dibuat saat query berikutnya tiba.
+        if failed {
+            break;
+        }
+    }
+}
+
+async fn connect_h3(
+    ep: &quinn::Endpoint,
+    cfg: &quinn::ClientConfig,
+    prov: &'static Provider,
+    host: &str,
+) -> Result<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>, String> {
     let mut connection = None;
     let mut last = String::from("tidak ada IP bootstrap");
     for addr in boots(prov, 443) {
-        let Ok(connecting) = ep.connect_with(cfg.clone(), addr, &host) else {
+        let Ok(connecting) = ep.connect_with(cfg.clone(), addr, host) else {
             continue;
         };
         match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
@@ -491,37 +584,23 @@ async fn h3_worker(
         }
     }
     let Some(conn) = connection else {
-        drain(&mut rx, &format!("DoH3 {host}: {last}")).await;
-        return;
+        return Err(format!("DoH3 {host}: {last}"));
     };
 
-    let (mut driver, mut send) = match h3::client::new(h3_quinn::Connection::new(conn)).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            drain(&mut rx, &format!("DoH3 handshake HTTP/3: {e}")).await;
-            return;
-        }
-    };
+    let (mut driver, sender) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .map_err(|e| format!("DoH3 handshake HTTP/3: {e}"))?;
+
+    // Poll driver sekali secara sinkron sebelum request pertama. Kalau tidak,
+    // request bisa terkirim sebelum driver sempat mengirim SETTINGS/stream
+    // kontrol, dan sebagian server (Cloudflare, Quad9) tidak pernah menjawab.
+    let _ = std::future::poll_fn(|cx| std::task::Poll::Ready(driver.poll_close(cx))).await;
 
     // Driver wajib dipoll terus-menerus; tanpa ini koneksi HTTP/3 tidak jalan.
     tokio::spawn(async move {
         let _ = driver.wait_idle().await;
     });
-
-    while let Some((query, reply)) = rx.recv().await {
-        let result = h3_roundtrip(&mut send, url, Bytes::from(query)).await;
-        let failed = result.is_err();
-        let _ = reply.send(result);
-        if failed {
-            break;
-        }
-    }
-}
-
-async fn drain(rx: &mut mpsc::Receiver<Job>, reason: &str) {
-    while let Some((_, reply)) = rx.recv().await {
-        let _ = reply.send(Err(reason.to_string()));
-    }
+    Ok(sender)
 }
 
 async fn h3_roundtrip<O>(
@@ -598,5 +677,38 @@ mod tests {
     #[test]
     fn describe_menolak_paket_yang_bukan_dns() {
         assert!(describe(&[0xFF; 4]).contains("tidak bisa diparse"));
+    }
+
+    #[test]
+    fn respons_tidak_cocok_dengan_query_ditolak() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+
+        let query = build_query("example.com.");
+        let id = u16::from_be_bytes([query[0], query[1]]);
+
+        let mut wrong_name = Message::new(id, MessageType::Response, OpCode::Query);
+        wrong_name.add_query(Query::query(
+            Name::from_ascii("example.org.").unwrap(),
+            RecordType::A,
+        ));
+        assert!(
+            !response_matches(&query, &wrong_name.to_vec().unwrap()),
+            "nama yang berbeda harus ditolak"
+        );
+
+        let mut wrong_id = Message::new(id.wrapping_add(1), MessageType::Response, OpCode::Query);
+        wrong_id.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        assert!(!response_matches(&query, &wrong_id.to_vec().unwrap()));
+
+        let mut good = Message::new(id, MessageType::Response, OpCode::Query);
+        good.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        assert!(response_matches(&query, &good.to_vec().unwrap()));
     }
 }

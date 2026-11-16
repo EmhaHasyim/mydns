@@ -324,7 +324,11 @@ fn now_secs() -> u64 {
 /// Arahkan DNS semua adapter aktif ke proxy lokal kita.
 /// DNS asli dicatat lebih dulu; pencatatan lama tidak ditimpa supaya
 /// mengklik provider dua kali tidak menghapus setelan asli.
-pub fn apply(provider_id: &str) -> Result<Vec<Adapter>, String> {
+///
+/// `listen_v6` menandakan proxy benar-benar punya listener di `[::1]:53`.
+/// Kalau tidak, `::1` tidak dipasang: DNS IPv6 yang menunjuk port mati akan
+/// memutus resolusi IPv6 tanpa alasan.
+pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String> {
     require_admin()?;
     let adapters = list_adapters()?;
     if adapters.is_empty() {
@@ -352,10 +356,12 @@ pub fn apply(provider_id: &str) -> Result<Vec<Adapter>, String> {
             "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '127.0.0.1' -ErrorAction Stop; $ok += '{}' }} catch {{ $bad += \"{}: $($_.Exception.Message)\" }}\n",
             a.index, a.index, a.index
         ));
-        script.push_str(&format!(
-            "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '::1' -ErrorAction Stop }} catch {{ }}\n",
-            a.index
-        ));
+        if listen_v6 {
+            script.push_str(&format!(
+                "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '::1' -ErrorAction Stop }} catch {{ }}\n",
+                a.index
+            ));
+        }
     }
     script.push_str("@{ok=$ok; bad=$bad} | ConvertTo-Json -Compress\n");
 

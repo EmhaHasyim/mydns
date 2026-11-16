@@ -470,6 +470,41 @@ impl App {
             return self.clear_detail_lines();
         };
 
+        // WARP tidak punya endpoint DoQ/DoH statis, jadi panel detailnya
+        // menampilkan status perangkat, bukan URL resolver.
+        if provider.warp {
+            let mut lines = vec![
+                text(provider.name, bold(ACCENT)),
+                text(provider.note, fg(MUTED)),
+                Line::default(),
+                text("MASQUE  ·  CONNECT-IP", bold(ACCENT_DIM)),
+                text("HTTP/3 + QUIC datagram", fg(TEXT)),
+                Line::default(),
+                heading("PERANGKAT"),
+            ];
+            match crate::warp::load() {
+                Ok(config) => {
+                    lines.push(text(config.device_id.clone(), fg(TEXT)));
+                    lines.push(text(config.endpoint_v4, fg(MUTED)));
+                }
+                Err(_) => lines.push(text(
+                    "belum terdaftar — jalankan `mydns warp register`",
+                    fg(WARN),
+                )),
+            }
+            if let Some(active) = self.active.as_ref().filter(|a| a.index == self.cursor) {
+                lines.push(Line::default());
+                lines.push(Line::from(vec![
+                    Span::styled("● aktif ", fg(OK)),
+                    Span::styled(
+                        format!("· {} · {} ms", active.proto.label(), active.ms),
+                        fg(MUTED),
+                    ),
+                ]));
+            }
+            return lines;
+        }
+
         // Judul memakai port yang benar-benar dipakai provider, supaya resolver
         // kustom dengan port lain tidak ditampilkan seolah-olah 853.
         let doq_title = match provider.doq {
@@ -721,6 +756,8 @@ async fn apply_flow(
         }
     };
 
+    // Hanya pasang `::1` sebagai DNS kalau listener IPv6 benar-benar terikat.
+    let listen_v6 = bound.v6;
     let (stop_tx, _) = watch::channel(false);
     let proxy = bound.proxy.clone();
     let stop_rx = stop_tx.subscribe();
@@ -760,7 +797,7 @@ async fn apply_flow(
 
     // 4. Baru arahkan adapter ke loopback.
     let id = provider.id;
-    let applied = tokio::task::spawn_blocking(move || win::apply(id)).await;
+    let applied = tokio::task::spawn_blocking(move || win::apply(id, listen_v6)).await;
     let adapters = match applied {
         Ok(Ok(adapters)) => adapters,
         Ok(Err(e)) => {
@@ -828,6 +865,7 @@ async fn apply_flow(
     let mut drift_stop = stop_tx.subscribe();
     let drift_tx = tx.clone();
     let drift_id = provider.id;
+    let drift_v6 = listen_v6;
     let drift_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3));
         let mut last_failure: Option<Instant> = None;
@@ -846,7 +884,8 @@ async fn apply_flow(
                     if !matches!(drifted, Ok(true)) {
                         continue;
                     }
-                    let applied = tokio::task::spawn_blocking(move || win::apply(drift_id)).await;
+                    let applied =
+                        tokio::task::spawn_blocking(move || win::apply(drift_id, drift_v6)).await;
                     match applied {
                         Ok(Ok(_)) => {
                             last_failure = None;

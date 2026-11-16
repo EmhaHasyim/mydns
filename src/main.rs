@@ -5,12 +5,13 @@ mod log;
 mod providers;
 mod server;
 mod ui;
+mod warp;
 mod win;
 
 use crate::log::Log;
 use crate::providers::{config_path, providers as resolver_list, read_config};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,6 +52,7 @@ fn main() {
             positional.get(1).map(|s| s.as_str()).unwrap_or("status"),
         ),
         "serve" => cmd_serve(positional.get(1).map(|s| s.as_str()).unwrap_or("adguard")),
+        "warp" => cmd_warp(positional.get(1).map(|s| s.as_str()).unwrap_or("status")),
         other => {
             eprintln!("perintah tidak dikenal: {other}\n");
             help();
@@ -278,7 +280,12 @@ fn cmd_providers() {
         if let Some(url) = provider.doh {
             println!("  {:<12} DoH     {url}", "");
         }
-        println!("  {:<12} IP      {}", "", provider.boot.join(", "));
+        if provider.warp {
+            println!("  {:<12} MASQUE  tunnel CONNECT-IP Cloudflare", "");
+        }
+        if !provider.boot.is_empty() {
+            println!("  {:<12} IP      {}", "", provider.boot.join(", "));
+        }
         println!();
     }
 
@@ -383,6 +390,75 @@ fn cmd_test() {
     });
 }
 
+fn cmd_warp(mode: &str) {
+    match mode {
+        "register" | "daftar" => {
+            let rt = runtime();
+            println!("Mendaftarkan perangkat WARP baru (mode MASQUE)…\n");
+            match rt.block_on(warp::register()) {
+                Ok(config) => {
+                    println!("WARP siap dipakai.\n");
+                    println!("  perangkat : {}", config.device_id);
+                    println!("  endpoint  : {}", config.endpoint_v4);
+                    println!("  tunnel IP : {}", config.ipv4);
+                    println!("  berkas    : {}", warp::config_path().display());
+                    println!(
+                        "\nPilih \"Cloudflare WARP\" di TUI, atau cek dulu dengan `mydns warp test`."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("gagal mendaftar: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "status" => match warp::load() {
+            Ok(config) => {
+                println!("WARP terdaftar:\n");
+                println!("  perangkat : {}", config.device_id);
+                println!("  endpoint  : {}", config.endpoint_v4);
+                if !config.endpoint_v6.is_empty() {
+                    println!("  endpoint6 : {}", config.endpoint_v6);
+                }
+                println!("  tunnel IP : {}", config.ipv4);
+                println!("  SNI       : {}", config.sni);
+                println!("  berkas    : {}", warp::config_path().display());
+            }
+            Err(e) => println!("WARP belum siap: {e}"),
+        },
+        "test" | "uji" => {
+            let rt = runtime();
+            let outcome: Result<(), String> = rt.block_on(async {
+                let config = warp::load()?;
+                let started = Instant::now();
+                let tunnel = warp::Tunnel::connect(&config).await?;
+                println!(
+                    "tunnel    : siap dalam {} ms",
+                    started.elapsed().as_millis()
+                );
+
+                let query = engine::build_query("example.com.");
+                let started = Instant::now();
+                let answer = tunnel.resolve(&query).await?;
+                println!(
+                    "example.com/A : {} ms — {}",
+                    started.elapsed().as_millis(),
+                    engine::describe(&answer)
+                );
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                eprintln!("gagal: {e}");
+                std::process::exit(1);
+            }
+        }
+        other => {
+            eprintln!("mode tidak dikenal: {other} (pakai register, status, atau test)");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn cmd_serve(provider_id: &str) {
     let Some(provider) = providers::find(provider_id) else {
         eprintln!(
@@ -448,6 +524,9 @@ PEMAKAIAN
   mydns providers       daftar resolver aktif + berkas kustom yang dibaca
   mydns test            uji DoQ, DoH3, DoH2 ke semua provider + latensi
   mydns serve <id>      jalankan proxy saja tanpa TUI (untuk debug)
+  mydns warp register   daftarkan perangkat Cloudflare WARP (mode MASQUE)
+  mydns warp status     tampilkan data perangkat WARP yang tersimpan
+  mydns warp test       buka tunnel WARP dan uji satu query DNS
   mydns help            pesan ini
 
 PROVIDER
