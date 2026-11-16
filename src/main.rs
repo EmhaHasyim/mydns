@@ -47,6 +47,12 @@ fn main() {
         "test" => cmd_test(),
         "providers" => cmd_providers(),
         "doctor" => cmd_doctor(),
+        "log" => cmd_log(
+            positional
+                .get(1)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(40),
+        ),
         "autostart" => cmd_autostart(
             &args,
             positional.get(1).map(|s| s.as_str()).unwrap_or("status"),
@@ -189,6 +195,11 @@ fn cmd_doctor() {
     } else {
         info("port 53 loopback sedang dipakai");
     }
+    if win::port53_v6_free() {
+        info("port 53 IPv6 loopback bebas");
+    } else {
+        info("port 53 IPv6 loopback sedang dipakai");
+    }
 
     match rt.block_on(server::probe()) {
         Ok(detail) => okay(&format!("proxy lokal menjawab — {detail}")),
@@ -265,6 +276,23 @@ fn cmd_doctor() {
     } else {
         println!("{problems} masalah ditemukan — lihat baris bertanda [fail].");
         std::process::exit(1);
+    }
+}
+
+fn cmd_log(count: usize) {
+    let count = count.clamp(1, 500);
+    println!("Log: {}\n", log::log_path().display());
+    match log::tail(count) {
+        Ok(lines) if lines.is_empty() => println!("(belum ada catatan)"),
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("belum ada log: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -519,6 +547,7 @@ PEMAKAIAN
   mydns status          tampilkan DNS adapter yang aktif sekarang
   mydns restore         kembalikan DNS ke setelan asli (DHCP / statis)
   mydns doctor          periksa kesehatan pengalihan DNS (tanpa mengubah apa pun)
+  mydns log [n]         tampilkan n baris terakhir log peristiwa
   mydns autostart on    pulihkan DNS otomatis setiap logon (disarankan)
   mydns autostart off   lepaskan pemulihan otomatis itu
   mydns providers       daftar resolver aktif + berkas kustom yang dibaca

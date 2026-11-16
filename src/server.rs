@@ -23,6 +23,10 @@ pub const ADDR_V6: &str = "[::1]:53";
 /// (masih TTL asli) tidak membuat data basi terlalu lama.
 const MAX_CACHE_SECS: u32 = 60;
 const MAX_CACHE_ITEMS: usize = 4096;
+/// Batas menunggu gerbang single-flight. Kalau pemegangnya macet (mis. upstream
+/// menggantung), query lain diteruskan sendiri daripada ikut menunggu sampai
+/// klien kehabisan waktu.
+const GATE_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
@@ -161,16 +165,17 @@ impl Proxy {
         // Query identik yang datang bersamaan cukup diteruskan sekali. Yang
         // lain menunggu gerbang ini lalu mengambil hasilnya dari cache.
         let gate = self.join_flight(&key).await;
-        let response = {
-            let _guard = Arc::clone(&gate).lock_owned().await;
-            match self.cache_get(&key).await {
-                Some((bytes, remaining)) => {
-                    self.log_query(&name, qtype, "gabung", 0);
-                    cached_response(&bytes, id, remaining)
-                }
-                None => self.forward(request, &key, &name, qtype).await,
+        let guard = tokio::time::timeout(GATE_WAIT, Arc::clone(&gate).lock_owned())
+            .await
+            .ok();
+        let response = match self.cache_get(&key).await {
+            Some((bytes, remaining)) => {
+                self.log_query(&name, qtype, "gabung", 0);
+                cached_response(&bytes, id, remaining)
             }
+            None => self.forward(request, &key, &name, qtype).await,
         };
+        drop(guard);
         self.leave_flight(&key, &gate).await;
         Some(fit_udp(response, &parsed, over_tcp))
     }
@@ -217,13 +222,7 @@ impl Proxy {
         let lifetime = Duration::from_secs(u64::from(ttl.min(MAX_CACHE_SECS)));
         let mut cache = self.cache.lock().await;
         if cache.len() >= MAX_CACHE_ITEMS {
-            // Buang yang sudah kedaluwarsa lebih dulu; kosongkan semua
-            // hanya kalau entri yang tersisa memang masih segar semua.
-            let now = Instant::now();
-            cache.retain(|_, entry| entry.expires > now);
-            if cache.len() >= MAX_CACHE_ITEMS {
-                cache.clear();
-            }
+            make_room(&mut cache);
         }
         cache.insert(
             key.clone(),
@@ -257,6 +256,24 @@ impl Proxy {
         if ours && Arc::strong_count(gate) == 1 {
             map.remove(key);
         }
+    }
+}
+
+/// Buang entri kedaluwarsa, lalu entri yang paling cepat kedaluwarsa, sampai
+/// ada ruang. Versi lama mengosongkan seluruh cache saat penuh, yang membuat
+/// semua query berikutnya harus keluar jaringan sekaligus.
+fn make_room(cache: &mut HashMap<Key, Entry>) {
+    let now = Instant::now();
+    cache.retain(|_, entry| entry.expires > now);
+    while cache.len() >= MAX_CACHE_ITEMS {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
     }
 }
 
@@ -642,5 +659,33 @@ mod tests {
     fn servfail_mengembalikan_paket_terlalu_pendek_apa_adanya() {
         let out = servfail(&[0x01, 0x02]);
         assert_eq!(out, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn cache_penuh_membuang_entri_paling_tua() {
+        let key = |name: String| Key {
+            name,
+            qtype: 1,
+            qclass: 1,
+            dnssec_ok: false,
+            checking_disabled: false,
+        };
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        for i in 0..MAX_CACHE_ITEMS {
+            cache.insert(
+                key(format!("n{i}")),
+                Entry {
+                    bytes: vec![0],
+                    expires: now + Duration::from_secs(60 + i as u64),
+                },
+            );
+        }
+
+        make_room(&mut cache);
+
+        assert_eq!(cache.len(), MAX_CACHE_ITEMS - 1);
+        assert!(!cache.contains_key(&key("n0".to_string())));
+        assert!(cache.contains_key(&key(format!("n{}", MAX_CACHE_ITEMS - 1))));
     }
 }

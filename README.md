@@ -124,6 +124,7 @@ di TUI yang mudah dipakai:
 | `mydns restore` | pulihkan DNS asli tanpa TUI |
 | `mydns providers` | daftar resolver aktif + berkas kustom yang dibaca |
 | `mydns doctor` | periksa kesehatan pengalihan DNS (tanpa mengubah apa pun) |
+| `mydns log [n]` | tampilkan n baris terakhir log peristiwa |
 | `mydns autostart on` | pulihkan DNS otomatis setiap logon (disarankan) |
 | `mydns autostart off` | lepaskan pemulihan otomatis itu |
 | `mydns test` | uji DoQ / DoH3 / DoH2 ke semua provider + latensi |
@@ -133,6 +134,10 @@ di TUI yang mudah dipakai:
 | `mydns warp test` | buka tunnel WARP dan uji satu query DNS |
 
 `mydns test` dan `mydns serve` **tidak** butuh admin dan tidak mengubah setelan DNS.
+
+Peristiwa penting (apply, restore, registrasi WARP, kegagalan) ditulis ke
+`%LOCALAPPDATA%\MyDns\mydns.log` dan bisa dibaca dengan `mydns log`. Log tidak
+pernah menggagalkan DNS: kalau berkasnya tidak bisa ditulis, aplikasi lanjut.
 
 ## Pengaman: DNS tidak pernah tertinggal rusak
 
@@ -275,8 +280,10 @@ Yang perlu diketahui:
 - **Header `CONNECT-IP` disusun sendiri.** `h3` hanya mengenal `connect-udp` dan
   `webtransport` pada `:protocol`, sedangkan WARP memakai nama Cloudflare
   `cf-connect-ip`, jadi field section QPACK-nya dirakit langsung.
-- `warp.json` berisi kunci privat perangkat — perlakukan seperti kata sandi.
-  `mydns warp register` ulang akan membuat perangkat baru.
+- `warp.json` berisi kunci privat perangkat, tetapi disimpan **terenkripsi
+  DPAPI** sehingga hanya user Windows yang sama di mesin ini yang bisa
+  membukanya. Berkas lama berisi base64 biasa tetap dibaca, lalu dienkripsi saat
+  disimpan lagi. `mydns warp register` ulang akan membuat perangkat baru.
 
 ## Tes
 
@@ -284,8 +291,9 @@ Yang perlu diketahui:
 cargo test
 ```
 
-Dua puluh tujuh tes menutupi jalur yang memproses byte dari jaringan dan berkas
-konfigurasi, yang tidak bisa diperiksa dengan mata:
+Tiga puluh empat tes menutupi jalur yang memproses byte dari jaringan dan berkas
+konfigurasi, yang tidak bisa diperiksa dengan mata. CI Windows menjalankan
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, dan `cargo test`:
 
 | Tes | Yang dijaga |
 |---|---|
@@ -294,6 +302,12 @@ konfigurasi, yang tidak bisa diperiksa dengan mata:
 | `cache_hit_menurunkan_ttl_dan_mengganti_id` | TTL yang dikirim ke klien tidak melebihi sisa umur cache; ID query dipasang kembali |
 | `opcode_bukan_query_tidak_dicache` | UPDATE/NOTIFY tidak pernah masuk cache |
 | `respons_tidak_cocok_dengan_query_ditolak` | ID atau pertanyaan yang berbeda ditolak, bukan diteruskan |
+| `cache_penuh_membuang_entri_paling_tua` | cache penuh membuang entri tertua, bukan mengosongkan semuanya |
+| `hedge_doh3_mendahulukan_doh2_saat_sibuk` | antrean DoH3 penuh memindahkan DoH2 ke depan |
+| `restore_memakai_nama_saat_index_berubah` | index adapter berubah, setelan asli tetap dipulihkan lewat nama |
+| `restore_melewati_adapter_yang_sudah_hilang` | adapter yang sudah tidak ada tidak dipaksa ke index lain |
+| `kunci_privat_bolak_balik_lewat_dpapi` | kunci privat WARP terenkripsi dan bisa dibuka kembali |
+| `timestamp_berbentuk_iso` | baris log memakai tanggal UTC yang konsisten |
 | `fit_udp_memotong_paket_besar_dengan_bit_tc` | respons TXT 639 byte dipotong ≤ 512 byte, TC diset, ID utuh |
 | `fit_udp_membiarkan_tcp_dan_paket_kecil` | TCP tidak dipotong, paket kecil lewat utuh |
 | `servfail_*` | SERVFAIL mempertahankan ID, menandai QR + RCODE, mengosongkan hitungan |
@@ -318,10 +332,12 @@ konfigurasi, yang tidak bisa diperiksa dengan mata:
 | Membaca DNS adapter | `GetAdaptersAddresses` (~1 ms); PowerShell hanya cadangan |
 | Latensi query ke resolver | 22–50 ms lewat DoQ / DoH3 |
 | Query dari cache | < 1 ms (loopback) |
-| 20 query identik bersamaan | 1 kali diteruskan, sisanya ikut hasil yang sama |
+| 20 query identik bersamaan | 1 kali diteruskan (3–4 ms total), sisanya ikut hasil yang sama |
+| 20 query paralel nama berbeda | 281 ms (sebelum hedge DoH3: 863 ms) |
 | Jawaban cache | TTL diturunkan sesuai sisa umur (maks 60 detik) |
 | Build | `cargo build --release`: 0 warning, `cargo clippy` bersih |
 | Uji 25 query paralel | selesai tanpa error |
+| IP bootstrap IPv6 | Cloudflare/Quad9/AdGuard punya jalur v6, dipakai setelah v4 gagal |
 
 Yang dihitung hanya adapter berstatus **Up** dan punya gateway. Adapter yang
 sedang Disconnected (mis. Wi-Fi saat memakai kabel) sengaja tidak disentuh,
@@ -349,8 +365,9 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
   pada satu waktu. Percobaan memakai banyak request sekaligus di satu koneksi
   membuat sebagian server (Quad9) berhenti menjawab, dan beberapa koneksi QUIC
   yang dibuka serentak ke IP bootstrap yang sama sering ditolak jaringan ini.
-  Jadi burst DoH3 ikut mengantre; DoQ (satu stream per query) dan DoH2 (satu
-  koneksi multiplex) tetap paralel.
+  Karena itu, begitu antrean DoH3 penuh, query dialihkan ke DoH2 yang mendukung
+  banyak request paralel (20 query paralel: 281 ms, dari 863 ms sebelumnya).
+  DoQ (satu stream per query) juga tetap paralel.
 - **Query identik yang datang bersamaan diteruskan sekali.** Sisanya menunggu
   lalu mengambil hasil dari cache, jadi lonjakan query yang sama tidak
   menggandakan trafik ke resolver.
@@ -369,4 +386,4 @@ supaya DNS-nya tidak tertinggal menunjuk proxy mati saat nanti tersambung.
 | `src/server.rs` | listener UDP/TCP di loopback, cache TTL, truncation |
 | `src/ui.rs` | TUI ratatui + alur terapkan/pulihkan |
 | `src/win.rs` | deteksi adapter, `Set-DnsClientServerAddress`, state file, watchdog, autostart |
-| `src/log.rs` | buffer log internal |
+| `src/log.rs` | buffer log internal, log berkas, timestamp UTC |

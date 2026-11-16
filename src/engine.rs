@@ -20,6 +20,10 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Setelah protokol gagal dua kali, ia dilewati selama ini sebelum dicoba lagi.
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_MESSAGE: usize = 65_535;
+/// Berapa query yang boleh menunggu di worker DoH3. Kecil supaya "sedang
+/// sibuk" cepat terdeteksi dan query berikutnya bisa dilayani DoH2 yang
+/// mendukung banyak request paralel.
+const H3_QUEUE: usize = 4;
 
 /// Kunci untuk state kecil yang tidak pernah menunggu I/O. Poison diabaikan:
 /// isinya tetap konsisten, dan satu panic tidak boleh mematikan resolver.
@@ -83,6 +87,9 @@ type Job = (Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>);
 
 pub struct Engine {
     ep: quinn::Endpoint,
+    /// Socket terpisah untuk tujuan IPv6. Kalau mesin tidak punya IPv6, ini
+    /// `None` dan alamat v6 dilewati tanpa mengganggu jalur IPv4.
+    ep6: Option<quinn::Endpoint>,
     prov: &'static Provider,
     /// Satu-satunya kunci async: guard-nya dipegang selama handshake QUIC.
     doq: Mutex<Option<quinn::Connection>>,
@@ -101,8 +108,10 @@ impl Engine {
     pub fn new(prov: &'static Provider) -> Result<Arc<Self>, String> {
         let ep = quinn::Endpoint::client(SocketAddr::from(([0u8, 0, 0, 0], 0)))
             .map_err(|e| format!("tidak bisa membuka socket QUIC: {e}"))?;
+        let ep6 = quinn::Endpoint::client(SocketAddr::from(([0u16; 8], 0))).ok();
         Ok(Arc::new(Self {
             ep,
+            ep6,
             prov,
             doq: Mutex::new(None),
             h3: StdMutex::new(None),
@@ -138,6 +147,10 @@ impl Engine {
             let last_used = order.remove(pos);
             order.insert(0, last_used);
         }
+        // Worker DoH3 hanya melayani satu query pada satu waktu. Saat antreannya
+        // penuh, DoH2 (satu koneksi multiplex) jauh lebih baik daripada ikut
+        // mengantre, jadi protokol itu didahulukan untuk query ini.
+        order = hedge_doh3(order, self.h3_busy());
         if order.is_empty() {
             return Err("provider tidak punya protokol yang didukung".to_string());
         }
@@ -226,6 +239,23 @@ impl Engine {
         }
     }
 
+    /// True kalau antrean worker DoH3 sudah penuh.
+    fn h3_busy(&self) -> bool {
+        guard(&self.h3)
+            .as_ref()
+            .is_some_and(|tx| tx.capacity() == 0)
+    }
+
+    /// Endpoint QUIC sesuai keluarga alamat tujuan. Endpoint IPv6 dibuat saat
+    /// Engine lahir, dan `None` berarti mesin ini tidak bisa membuka socket v6.
+    fn endpoint_for(&self, addr: SocketAddr) -> Option<quinn::Endpoint> {
+        if addr.is_ipv6() {
+            self.ep6.clone()
+        } else {
+            Some(self.ep.clone())
+        }
+    }
+
     // ---------- DoQ ----------
 
     async fn doq_conn(&self) -> Result<quinn::Connection, String> {
@@ -242,7 +272,11 @@ impl Engine {
         let cfg = quic_client_config("doq")?;
         let mut last = String::from("tidak ada IP bootstrap");
         for addr in boots(self.prov, port) {
-            let connecting = match self.ep.connect_with(cfg.clone(), addr, host) {
+            let Some(endpoint) = self.endpoint_for(addr) else {
+                last = format!("{addr}: socket IPv6 tidak tersedia");
+                continue;
+            };
+            let connecting = match endpoint.connect_with(cfg.clone(), addr, host) {
                 Ok(c) => c,
                 Err(e) => {
                     last = format!("{addr}: {e}");
@@ -299,11 +333,12 @@ impl Engine {
         {
             return Ok(tx.clone());
         }
-        let (tx, rx) = mpsc::channel::<Job>(64);
+        let (tx, rx) = mpsc::channel::<Job>(H3_QUEUE);
         let ep = self.ep.clone();
+        let ep6 = self.ep6.clone();
         let prov = self.prov;
         let cfg = quic_client_config("h3")?;
-        tokio::spawn(async move { h3_worker(ep, cfg, prov, rx).await });
+        tokio::spawn(async move { h3_worker(ep, ep6, cfg, prov, rx).await });
         *slot = Some(tx.clone());
         Ok(tx)
     }
@@ -490,6 +525,16 @@ fn response_matches(query: &[u8], response: &[u8]) -> bool {
             .eq_ignore_ascii_case(&answered.name().to_ascii())
 }
 
+/// Saat jalur DoH3 sibuk, pindahkan DoH2 ke depan urutan percobaan. DoH2 bisa
+/// melayani banyak request sekaligus, sementara worker DoH3 hanya satu per satu.
+fn hedge_doh3(mut order: Vec<Proto>, h3_busy: bool) -> Vec<Proto> {
+    if h3_busy && let Some(pos) = order.iter().position(|proto| *proto == Proto::DoH2) {
+        let doh2 = order.remove(pos);
+        order.insert(0, doh2);
+    }
+    order
+}
+
 /// Ringkas bagian penting dari respons DNS untuk ditampilkan ke pengguna.
 pub fn describe(resp: &[u8]) -> String {
     use hickory_proto::op::Message;
@@ -533,6 +578,7 @@ pub fn build_query(domain: &str) -> Vec<u8> {
 /// jawaban untuk sebagian server kalau satu `SendRequest` dipakai bersamaan.
 async fn h3_worker(
     ep: quinn::Endpoint,
+    ep6: Option<quinn::Endpoint>,
     cfg: quinn::ClientConfig,
     prov: &'static Provider,
     mut rx: mpsc::Receiver<Job>,
@@ -546,7 +592,7 @@ async fn h3_worker(
     // driver (lihat `connect_h3`). Kalau gagal, worker keluar dan receiver
     // ikut di-drop: job yang menunggu langsung mendapat error, dan query
     // berikutnya membuat worker/koneksi baru.
-    let Ok(mut sender) = connect_h3(&ep, &cfg, prov, &host).await else {
+    let Ok(mut sender) = connect_h3(&ep, ep6.as_ref(), &cfg, prov, &host).await else {
         return;
     };
 
@@ -564,6 +610,7 @@ async fn h3_worker(
 
 async fn connect_h3(
     ep: &quinn::Endpoint,
+    ep6: Option<&quinn::Endpoint>,
     cfg: &quinn::ClientConfig,
     prov: &'static Provider,
     host: &str,
@@ -571,7 +618,12 @@ async fn connect_h3(
     let mut connection = None;
     let mut last = String::from("tidak ada IP bootstrap");
     for addr in boots(prov, 443) {
-        let Ok(connecting) = ep.connect_with(cfg.clone(), addr, host) else {
+        let endpoint = if addr.is_ipv6() { ep6 } else { Some(ep) };
+        let Some(endpoint) = endpoint else {
+            last = format!("{addr}: socket IPv6 tidak tersedia");
+            continue;
+        };
+        let Ok(connecting) = endpoint.connect_with(cfg.clone(), addr, host) else {
             continue;
         };
         match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
@@ -677,6 +729,21 @@ mod tests {
     #[test]
     fn describe_menolak_paket_yang_bukan_dns() {
         assert!(describe(&[0xFF; 4]).contains("tidak bisa diparse"));
+    }
+
+    #[test]
+    fn hedge_doh3_mendahulukan_doh2_saat_sibuk() {
+        let order = vec![Proto::DoQ, Proto::DoH3, Proto::DoH2];
+        assert_eq!(
+            hedge_doh3(order.clone(), false),
+            vec![Proto::DoQ, Proto::DoH3, Proto::DoH2]
+        );
+        assert_eq!(
+            hedge_doh3(order, true),
+            vec![Proto::DoH2, Proto::DoQ, Proto::DoH3]
+        );
+        // Provider tanpa DoH2 tidak berubah.
+        assert_eq!(hedge_doh3(vec![Proto::DoH3], true), vec![Proto::DoH3]);
     }
 
     #[test]

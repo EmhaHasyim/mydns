@@ -95,7 +95,12 @@ const BUILTINS: &[Provider] = &[
         // Cloudflare tidak menjalankan DoQ publik; DoH-nya mendukung HTTP/3.
         doq: None,
         doh: Some("https://cloudflare-dns.com/dns-query"),
-        boot: &["1.1.1.1", "1.0.0.1"],
+        boot: &[
+            "1.1.1.1",
+            "1.0.0.1",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1001",
+        ],
         warp: false,
     },
     Provider {
@@ -104,7 +109,7 @@ const BUILTINS: &[Provider] = &[
         note: "blokir malware, DNSSEC",
         doq: Some(("dns.quad9.net", 853)),
         doh: Some("https://dns.quad9.net/dns-query"),
-        boot: &["9.9.9.9", "149.112.112.112"],
+        boot: &["9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"],
         warp: false,
     },
     Provider {
@@ -113,7 +118,12 @@ const BUILTINS: &[Provider] = &[
         note: "blokir iklan + tracker",
         doq: Some(("dns.adguard-dns.com", 853)),
         doh: Some("https://dns.adguard-dns.com/dns-query"),
-        boot: &["94.140.14.14", "94.140.15.15"],
+        boot: &[
+            "94.140.14.14",
+            "94.140.15.15",
+            "2a10:50c0::ad1:ff",
+            "2a10:50c0::ad2:ff",
+        ],
         warp: false,
     },
     Provider {
@@ -408,5 +418,17 @@ mod tests {
         // baru diketahui setelah registrasi.
         assert!(list.iter().all(|p| !p.boot.is_empty() || p.warp));
         assert!(list.iter().any(|p| p.warp), "provider WARP harus ada");
+        // Tiga resolver utama harus punya jalur IPv6 supaya jaringan v6-only
+        // tetap bisa dipakai.
+        for id in ["cloudflare", "quad9", "adguard"] {
+            let provider = list.iter().find(|p| p.id == id).unwrap();
+            assert!(
+                provider
+                    .boot
+                    .iter()
+                    .any(|ip| ip.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6())),
+                "{id} harus punya IP bootstrap IPv6"
+            );
+        }
     }
 }

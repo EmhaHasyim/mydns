@@ -136,6 +136,9 @@ pub struct App {
     hits: u64,
     misses: u64,
     tick: u64,
+    /// Latensi beberapa query terakhir per provider (maks 20), untuk p50 di
+    /// panel detail.
+    latencies: Vec<Vec<u128>>,
 }
 
 fn item_count() -> usize {
@@ -268,6 +271,19 @@ impl App {
                     ms
                 );
                 self.dns_now = format!("{adapters} adapter → 127.0.0.1  ·  proxy lokal :53");
+                if let Some(samples) = self.latencies.get_mut(index) {
+                    samples.push(ms);
+                    if samples.len() > 20 {
+                        samples.remove(0);
+                    }
+                }
+                crate::log::event(&format!(
+                    "aktif: {} lewat {} ({} ms, {} adapter)",
+                    providers()[index].name,
+                    proto.label(),
+                    ms,
+                    adapters
+                ));
             }
             Msg::Cleared(text) => {
                 self.idle();
@@ -275,12 +291,14 @@ impl App {
                 self.hits = 0;
                 self.misses = 0;
                 self.dns_now = "setelan DNS asli dipulihkan".to_string();
+                crate::log::event(&format!("restore: {text}"));
                 self.status = text;
             }
             Msg::Failed(error) => {
                 self.idle();
                 self.is_error = true;
                 self.active = None;
+                crate::log::event(&format!("gagal: {error}"));
                 self.status = error;
             }
             Msg::Stats { hits, misses } => {
@@ -465,6 +483,18 @@ impl App {
         frame.render_widget(detail, area);
     }
 
+    /// Ringkasan latensi query terakhir untuk satu provider.
+    fn latency_summary(&self, index: usize) -> Option<String> {
+        let samples = self.latencies.get(index)?;
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        Some(format!("p50 {p50} ms · {} query", samples.len()))
+    }
+
     fn detail_lines(&self) -> Vec<Line<'static>> {
         let Some(provider) = providers().get(self.cursor) else {
             return self.clear_detail_lines();
@@ -501,6 +531,9 @@ impl App {
                         fg(MUTED),
                     ),
                 ]));
+                if let Some(summary) = self.latency_summary(active.index) {
+                    lines.push(text(summary, fg(MUTED)));
+                }
             }
             return lines;
         }
@@ -942,6 +975,7 @@ pub fn run(
         hits: 0,
         misses: 0,
         tick: 0,
+        latencies: vec![Vec::new(); providers().len()],
     };
 
     // Baca DNS aktif di latar belakang supaya frame pertama tidak tertahan.

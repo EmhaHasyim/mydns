@@ -67,6 +67,10 @@ pub struct Config {
     #[serde(default = "default_authority")]
     pub authority: String,
     pub registered_at: u64,
+    /// Kunci privat di berkas disimpan terenkripsi DPAPI. Berkas lama tanpa
+    /// field ini berisi base64 biasa dan tetap bisa dibaca.
+    #[serde(default)]
+    pub protected: bool,
 }
 
 fn default_sni() -> String {
@@ -93,7 +97,15 @@ pub fn load() -> Result<Config, String> {
             path.display()
         )
     })?;
-    serde_json::from_str(&raw).map_err(|e| format!("{} rusak: {e}", path.display()))
+    let mut config: Config =
+        serde_json::from_str(&raw).map_err(|e| format!("{} rusak: {e}", path.display()))?;
+    if config.protected {
+        config.private_key = unprotect_secret(&config.private_key)?;
+        // Di memori kuncinya sudah berbentuk asli; `save` akan mengenkripsi
+        // ulang kalau nilainya ditulis kembali.
+        config.protected = false;
+    }
+    Ok(config)
 }
 
 pub fn save(config: &Config) -> Result<(), String> {
@@ -102,8 +114,80 @@ pub fn save(config: &Config) -> Result<(), String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("gagal membuat {}: {e}", dir.display()))?;
     }
-    let raw = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    // Salinan ini yang ditulis ke disk; struct di pemanggil tetap berisi kunci
+    // asli supaya bisa langsung dipakai membuka tunnel.
+    let mut stored = config.clone();
+    if !stored.protected {
+        stored.private_key = protect_secret(&stored.private_key)?;
+        stored.protected = true;
+    }
+    let raw = serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?;
     std::fs::write(&path, raw).map_err(|e| format!("gagal menulis {}: {e}", path.display()))
+}
+
+// ── kunci privat terenkripsi (DPAPI) ─────────────────────────────────
+
+/// Enkripsi DPAPI: hasilnya hanya bisa dibuka oleh user Windows yang sama di
+/// mesin ini. `warp.json` tetap berisi kunci privat, tetapi salinan berkas itu
+/// tidak bisa langsung dipakai di mesin lain.
+fn protect_secret(plain: &str) -> Result<String, String> {
+    Ok(b64::encode(&dpapi(plain.as_bytes(), true)?))
+}
+
+fn unprotect_secret(encoded: &str) -> Result<String, String> {
+    let raw = b64::decode(encoded)?;
+    let plain = dpapi(&raw, false)?;
+    String::from_utf8(plain).map_err(|_| "kunci privat hasil dekripsi bukan UTF-8".to_string())
+}
+
+fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(data.len()).map_err(|_| "data terlalu besar".to_string())?,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    let ok = unsafe {
+        if protect {
+            CryptProtectData(
+                &input,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+    };
+    if ok == 0 {
+        return Err(format!("DPAPI gagal: {}", std::io::Error::last_os_error()));
+    }
+
+    let bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData as *mut core::ffi::c_void);
+    }
+    Ok(bytes)
 }
 
 impl Config {
@@ -242,6 +326,7 @@ pub async fn register() -> Result<Config, String> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        protected: false,
     };
     save(&config)?;
     Ok(config)
@@ -1455,6 +1540,14 @@ mod tests {
             "[2606:4700:103::]:443"
         );
         assert_eq!(normalize_endpoint("").map(|v| v.is_empty()), None);
+    }
+
+    #[test]
+    fn kunci_privat_bolak_balik_lewat_dpapi() {
+        let plain = "kunci-privat-uji-123";
+        let protected = protect_secret(plain).unwrap();
+        assert_ne!(protected, b64::encode(plain.as_bytes()));
+        assert_eq!(unprotect_secret(&protected).unwrap(), plain);
     }
 
     #[test]
