@@ -17,6 +17,15 @@ use ratatui::widgets::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Jarak pemeriksaan DNS adapter. Sepuluh detik masih cepat untuk kasus yang
+/// nyata (pindah Wi-Fi, bangun dari sleep) tapi tidak memanggil API adapter
+/// setiap 3 detik selama sesi berjam-jam.
+const DRIFT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Jarak antar probe pemanas di `apply_flow`: cukup sering untuk menutupi
+/// `FAILURE_COOLDOWN` (60 s) tanpa menambah trafik berarti.
+const WARM_INTERVAL: Duration = Duration::from_secs(30);
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -120,6 +129,10 @@ pub struct Session {
     proxy_task: JoinHandle<()>,
     stats_task: JoinHandle<()>,
     drift_task: JoinHandle<()>,
+    /// Probe latihan berkala: menghangatkan ulang koneksi/kandidat protokol
+    /// setelah gangguan jaringan, supaya query pengguna berikutnya tidak jadi
+    /// korban yang menunggu `FAILURE_COOLDOWN` habis.
+    warm_task: JoinHandle<()>,
     /// Ada isinya kalau sesi ini berjalan sebagai VPN penuh.
     vpn: Option<crate::vpn::Vpn>,
 }
@@ -272,7 +285,7 @@ impl App {
             self.active.as_ref().map(|a| a.index).unwrap_or(0)
         };
         if !self.begin(format!(
-            "menyalakan VPN — trafik lewat WARP, DNS {}…",
+            "menyalakan VPN — seluruh trafik lewat WARP, DNS {}…",
             providers()[index].name
         )) {
             return;
@@ -705,7 +718,10 @@ impl App {
         let mut lines = vec![
             Line::default(),
             heading("VPN  ·  FULL TUNNEL"),
-            text("seluruh trafik IPv4 lewat WARP", fg(TEXT)),
+            text(
+                "seluruh trafik lewat WARP (IPv4, IPv6 bila tersedia)",
+                fg(TEXT),
+            ),
         ];
         match self.exit_ip.as_deref() {
             Some(ip) => lines.push(text(format!("IP keluar {ip}"), fg(OK))),
@@ -839,8 +855,8 @@ impl App {
         } else {
             let visible = entries.len().min(rows);
             lines.resize(rows - visible, Line::default());
-            for entry in &entries[entries.len() - visible..] {
-                lines.push(text(entry.clone(), fg(MUTED)));
+            for entry in entries.iter().skip(entries.len() - visible) {
+                lines.push(text(entry.to_string(), fg(MUTED)));
             }
         }
 
@@ -910,6 +926,23 @@ async fn abort(
     let _ = tx.send(Msg::Failed(message));
 }
 
+async fn abort_with_restore(
+    stop: watch::Sender<bool>,
+    proxy_task: JoinHandle<()>,
+    tx: UnboundedSender<Msg>,
+    message: String,
+) {
+    // Proxy lama sudah dihentikan sebelum langkah ini. Kalau setup baru gagal,
+    // adapter tidak boleh dibiarkan menunjuk loopback yang tidak ada listener.
+    let _ = tokio::task::spawn_blocking(win::restore).await;
+    abort(stop, proxy_task, tx, message).await;
+}
+
+async fn fail_restore(tx: UnboundedSender<Msg>, message: String) {
+    let _ = tokio::task::spawn_blocking(win::restore).await;
+    let _ = tx.send(Msg::Failed(message));
+}
+
 async fn stop_session(session: &Arc<Mutex<Option<Session>>>) {
     let taken = { session.lock().await.take() };
     if let Some(session) = taken {
@@ -918,12 +951,14 @@ async fn stop_session(session: &Arc<Mutex<Option<Session>>>) {
             proxy_task,
             stats_task,
             drift_task,
+            warm_task,
             vpn,
         } = session;
         let _ = stop.send(true);
         let _ = proxy_task.await;
         let _ = stats_task.await;
         let _ = drift_task.await;
+        let _ = warm_task.await;
         // Proxy berhenti dulu, baru tunnel: pengguna tidak pernah kehilangan
         // resolver selama rute masih dialihkan.
         if let Some(vpn) = vpn {
@@ -952,7 +987,7 @@ async fn apply_flow(
     let engine = match Engine::new(provider) {
         Ok(engine) => engine,
         Err(e) => {
-            let _ = tx.send(Msg::Failed(e));
+            fail_restore(tx, e).await;
             return;
         }
     };
@@ -960,7 +995,7 @@ async fn apply_flow(
     let bound = match server::bind(engine.clone(), log).await {
         Ok(bound) => bound,
         Err(e) => {
-            let _ = tx.send(Msg::Failed(e));
+            fail_restore(tx, e).await;
             return;
         }
     };
@@ -978,7 +1013,7 @@ async fn apply_flow(
     let proto = match engine.resolve(&query).await {
         Ok((_, proto)) => proto,
         Err(e) => {
-            abort(
+            abort_with_restore(
                 stop_tx,
                 proxy_task,
                 tx,
@@ -994,7 +1029,7 @@ async fn apply_flow(
     //    pengguna disentuh. Kalau tidak, gagal di sini — bukan setelah adapter
     //    sudah diarahkan ke port yang mati.
     if let Err(e) = server::probe().await {
-        abort(
+        abort_with_restore(
             stop_tx,
             proxy_task,
             tx,
@@ -1014,7 +1049,7 @@ async fn apply_flow(
         match crate::vpn::Vpn::up().await {
             Ok(tunnel) => Some(tunnel),
             Err(e) => {
-                abort(stop_tx, proxy_task, tx, e).await;
+                abort_with_restore(stop_tx, proxy_task, tx, e).await;
                 return;
             }
         }
@@ -1032,14 +1067,14 @@ async fn apply_flow(
             if let Some(vpn) = vpn.take() {
                 let _ = vpn.down().await;
             }
-            abort(stop_tx, proxy_task, tx, e).await;
+            abort_with_restore(stop_tx, proxy_task, tx, e).await;
             return;
         }
         Err(e) => {
             if let Some(vpn) = vpn.take() {
                 let _ = vpn.down().await;
             }
-            abort(
+            abort_with_restore(
                 stop_tx,
                 proxy_task,
                 tx,
@@ -1062,8 +1097,7 @@ async fn apply_flow(
         if let Some(vpn) = vpn.take() {
             let _ = vpn.down().await;
         }
-        let _ = tokio::task::spawn_blocking(win::restore).await;
-        abort(
+        abort_with_restore(
             stop_tx,
             proxy_task,
             tx,
@@ -1095,6 +1129,30 @@ async fn apply_flow(
         }
     });
 
+    // 6b. Probe pemanas berkala. Tanpa ini, satu gangguan jaringan membuat
+    // protokol dicatat gagal lalu dilewati selama FAILURE_COOLDOWN — dan query
+    // pengguna berikutnya yang harus menanggungnya. Probe memakai query yang
+    // sama dengan warm-up di atas.
+    let mut stop_warm = stop_tx.subscribe();
+    let warm_engine = engine.clone();
+    let warm_query = build_query("example.com.");
+    let warm_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(WARM_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = stop_warm.changed() => {
+                    if changed.is_err() || *stop_warm.borrow() { break; }
+                }
+                _ = tick.tick() => {
+                    // Hasilnya sengaja diabaikan: gunanya hanya memanaskan
+                    // koneksi dan membersihkan catatan kegagalan di engine.
+                    let _ = warm_engine.resolve(&warm_query).await;
+                }
+            }
+        }
+    });
+
     // 7. Jaga perubahan jaringan. Pindah Wi-Fi/VPN atau bangun dari sleep bisa
     //    membuat DHCP menimpa DNS adapter; selama sesi ini hidup, adapter yang
     //    tidak lagi menunjuk proxy dikembalikan (dan tetap tercatat di state,
@@ -1104,7 +1162,8 @@ async fn apply_flow(
     let drift_id = provider.id;
     let drift_v6 = listen_v6;
     let drift_task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        let mut tick = tokio::time::interval(DRIFT_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_failure: Option<Instant> = None;
         loop {
             tokio::select! {
@@ -1112,8 +1171,8 @@ async fn apply_flow(
                     if changed.is_err() || *drift_stop.borrow() { break; }
                 }
                 _ = tick.tick() => {
-                    // Jangan menghajar PowerShell tiap 3 detik kalau hak admin
-                    // ternyata tidak ada.
+                    // Jangan menghajar PowerShell tiap interval kalau hak
+                    // admin ternyata tidak ada.
                     if last_failure.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
                         continue;
                     }
@@ -1143,6 +1202,7 @@ async fn apply_flow(
         proxy_task,
         stats_task,
         drift_task,
+        warm_task,
         vpn: vpn.take(),
     });
 

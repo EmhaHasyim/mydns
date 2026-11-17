@@ -16,7 +16,15 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(2500);
-const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Batas satu query ke upstream. Sengaja di bawah batas kesabaran klien
+/// Windows (~1-2 s sebelum mengirim ulang): query yang kita terus-terusan
+/// tahan hanya memakan slot dan memicu retry, sementara protokol pengganti
+/// sudah menunggu di `resolve`.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Jeda sebelum query yang sama dikirim paralel lewat protokol cadangan.
+/// Cukup untuk memberi protokol utama kesempatan menyala, tapi tidak sampai
+/// membuat query pertama terasa menggantung.
+const HEDGE_DELAY: Duration = Duration::from_millis(300);
 /// Setelah protokol gagal dua kali, ia dilewati selama ini sebelum dicoba lagi.
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_MESSAGE: usize = 65_535;
@@ -71,7 +79,29 @@ fn quic_client_config(alpn: &'static str) -> Result<quinn::ClientConfig, String>
 
 fn url_host(url: &str) -> &str {
     let rest = url.split("://").nth(1).unwrap_or(url);
-    rest.split('/').next().unwrap_or(rest)
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Buang userinfo (`user@host`) dan port; SNI hanya menerima nama host.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(inner) = authority.strip_prefix('[') {
+        return inner.split(']').next().unwrap_or(inner);
+    }
+    authority.split(':').next().unwrap_or(authority)
+}
+
+fn url_port(url: &str) -> u16 {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.starts_with('[') {
+        return authority
+            .split_once("]:")
+            .and_then(|(_, port)| port.parse().ok())
+            .unwrap_or(443);
+    }
+    authority
+        .split_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(443)
 }
 
 fn boots(prov: &Provider, port: u16) -> Vec<SocketAddr> {
@@ -93,10 +123,18 @@ pub struct Engine {
     prov: &'static Provider,
     /// Satu-satunya kunci async: guard-nya dipegang selama handshake QUIC.
     doq: Mutex<Option<quinn::Connection>>,
+    /// Kunci connect per protokol. Dipakai saat slot masih kosong: query yang
+    /// datang bersamaan menunggu di sini, bukan ikut membuka koneksi kedua yang
+    /// langsung jadi sampah. Isinya selalu `Some`, jadi lock-nya tidak pernah
+    /// gagal — hanya antrean.
+    h2_connect: Mutex<()>,
+    h3_connect: StdMutex<()>,
     h3: StdMutex<Option<mpsc::Sender<Job>>>,
     h2: StdMutex<Option<h2::client::SendRequest<Bytes>>>,
     /// Tunnel WARP dibuka sekali saat pertama dipakai, lalu dipakai ulang.
     warp: Mutex<Option<Arc<crate::warp::Tunnel>>>,
+    /// Kunci handshake WARP; isinya selalu `Some`, hanya antrean.
+    warp_connect: Mutex<()>,
     preferred: StdMutex<Option<Proto>>,
     /// Berapa kali sebuah protokol gagal berturut-turut dan kapan terakhir.
     /// Setelah dua kali, protokol itu dilewati sementara supaya fallback tidak
@@ -114,9 +152,12 @@ impl Engine {
             ep6,
             prov,
             doq: Mutex::new(None),
+            h2_connect: Mutex::new(()),
+            h3_connect: StdMutex::new(()),
             h3: StdMutex::new(None),
             h2: StdMutex::new(None),
             warp: Mutex::new(None),
+            warp_connect: Mutex::new(()),
             preferred: StdMutex::new(None),
             failures: StdMutex::new(HashMap::new()),
         }))
@@ -157,17 +198,14 @@ impl Engine {
 
         let mut errors = Vec::new();
         for proto in order {
-            match self.query_proto(proto, query).await {
-                Ok(resp) if response_matches(query, &resp) => {
-                    *guard(&self.preferred) = Some(proto);
-                    guard(&self.failures).remove(&proto);
-                    return Ok((resp, proto));
+            match self.query_hedged(proto, query).await {
+                Ok((resp, used)) if response_matches(query, &resp) => {
+                    *guard(&self.preferred) = Some(used);
+                    guard(&self.failures).remove(&used);
+                    return Ok((resp, used));
                 }
-                // Respons kosong, respons yang tidak cocok dengan query, dan
-                // error diperlakukan sama: protokol dicatat gagal, lalu query
-                // lanjut ke protokol berikutnya. Tanpa pemeriksaan ini respons
-                // dari jalur yang salah (mis. tunnel WARP yang mencocokkan
-                // hanya lewat port) bisa diteruskan ke klien.
+                // Respons kosong dan error diperlakukan sama: protokol dicatat
+                // gagal, lalu query lanjut ke protokol berikutnya.
                 Ok(_) => {
                     self.note_failure(proto).await;
                     errors.push(format!(
@@ -177,7 +215,7 @@ impl Engine {
                 }
                 Err(e) => {
                     self.note_failure(proto).await;
-                    errors.push(format!("{}: {e}", proto.label()));
+                    errors.push(e);
                 }
             }
         }
@@ -193,23 +231,95 @@ impl Engine {
         }
     }
 
+    /// Satu percobaan dengan hedging: kalau protokol utama belum menjawab
+    /// dalam `HEDGE_DELAY`, protokol cadangan dijalankan bersamaan. Yang
+    /// pertama menjawab dipakai, yang kalah dibuang. Ini menghilangkan
+    /// sentuhan pertama yang lambat pada query pertama tiap sesi.
+    async fn query_hedged(&self, proto: Proto, query: &[u8]) -> Result<(Vec<u8>, Proto), String> {
+        let mut others = self.prov.protos();
+        others.retain(|p| *p != proto);
+        let backup = others.first().copied();
+        let Some(backup) = backup.filter(|_| !matches!(proto, Proto::DoH2)) else {
+            let resp = self.query_proto(proto, query).await?;
+            return Ok((resp, proto));
+        };
+
+        let primary = self.query_proto(proto, query);
+        let hedge = async {
+            tokio::time::sleep(HEDGE_DELAY).await;
+            self.query_proto(backup, query).await
+        };
+        tokio::pin!(primary);
+        tokio::pin!(hedge);
+
+        // Pilih jawaban pertama yang cocok dengan query. Kalau yang datang
+        // lebih dulu tidak cocok (mis. tunnel WARP yang keliru menjawab),
+        // tunggu yang satu lagi — jangan langsung melaporkan gagal.
+        //
+        // Penting: cabang yang menang HARUS menunggu future yang kalah.
+        // Mem-poll ulang future yang sudah selesai akan memicu panic
+        // "`async fn` resumed after completion".
+        let primary_error;
+        let hedge_error;
+        tokio::select! {
+            result = &mut primary => {
+                match result {
+                    Ok(resp) if response_matches(query, &resp) => return Ok((resp, proto)),
+                    Ok(_) => primary_error = format!("{}: respons tidak cocok dengan query", proto.label()),
+                    Err(e) => primary_error = format!("{}: {e}", proto.label()),
+                }
+                match tokio::time::timeout(QUERY_TIMEOUT, &mut hedge).await {
+                    Ok(Ok(resp)) if response_matches(query, &resp) => Ok((resp, backup)),
+                    Ok(Ok(_)) => Err(format!(
+                        "{}: respons tidak cocok dengan query",
+                        backup.label()
+                    )),
+                    Ok(Err(e)) => Err(format!("{}: {e}", backup.label())),
+                    Err(_) => Err(primary_error),
+                }
+            }
+            result = &mut hedge => {
+                match result {
+                    Ok(resp) if response_matches(query, &resp) => return Ok((resp, backup)),
+                    Ok(_) => hedge_error = format!("{}: respons tidak cocok dengan query", backup.label()),
+                    Err(e) => hedge_error = format!("{}: {e}", backup.label()),
+                }
+                match tokio::time::timeout(QUERY_TIMEOUT, &mut primary).await {
+                    Ok(Ok(resp)) if response_matches(query, &resp) => Ok((resp, proto)),
+                    Ok(Ok(_)) => Err(format!(
+                        "{}: respons tidak cocok dengan query",
+                        proto.label()
+                    )),
+                    Ok(Err(e)) => Err(format!("{}: {e}", proto.label())),
+                    Err(_) => Err(hedge_error),
+                }
+            }
+        }
+    }
+
     async fn warp_query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         self.warp_tunnel().await?.resolve(query).await
     }
 
-    /// Ambil tunnel WARP yang sudah terbuka, atau buka yang baru. Kunci hanya
-    /// dipegang saat mengecek/mengisi slot supaya query lain tidak ikut
-    /// menunggu selama handshake.
+    /// Ambil tunnel WARP yang sudah terbuka, atau buka yang baru.
+    ///
+    /// Slot hanya dikunci sebentar untuk membaca/mengisi. Handshake WARP bisa
+    /// memakan beberapa detik, dan `warp_connect` menjaga agar hanya satu query
+    /// yang mengerjakannya — yang lain menunggu lalu memakai hasilnya.
     async fn warp_tunnel(&self) -> Result<Arc<crate::warp::Tunnel>, String> {
-        let mut slot = self.warp.lock().await;
-        if let Some(tunnel) = slot.as_ref() {
+        if let Some(tunnel) = self.warp.lock().await.as_ref() {
+            return Ok(tunnel.clone());
+        }
+        let _gate = self.warp_connect.lock().await;
+        // Cek ulang: tunnel mungkin sudah dibuat query yang menunggu di depan.
+        if let Some(tunnel) = self.warp.lock().await.as_ref() {
             return Ok(tunnel.clone());
         }
         // `ensure` mendaftarkan perangkat sendiri kalau belum ada, jadi
         // memilih provider WARP tidak memerlukan perintah tambahan.
         let config = crate::warp::ensure().await?;
         let tunnel = crate::warp::Tunnel::connect(&config).await?;
-        *slot = Some(tunnel.clone());
+        *self.warp.lock().await = Some(tunnel.clone());
         Ok(tunnel)
     }
 
@@ -328,11 +438,21 @@ impl Engine {
 
     // ---------- DoH3 ----------
 
+    /// Ambil koneksi HTTP/3 yang ada, atau buka yang baru.
+    ///
+    /// Saat slot kosong, kunci `h3_connect` dipegang selama worker dibuat
+    /// supaya query yang datang bersamaan tidak sama-sama membuat worker
+    /// (dan koneksi QUIC) yang salah satunya langsung jadi sampah.
     fn h3_sender(&self) -> Result<mpsc::Sender<Job>, String> {
-        let mut slot = guard(&self.h3);
-        if let Some(tx) = slot.as_ref()
-            && !tx.is_closed()
-        {
+        // Jalur cepat tanpa kunci: hampir semua query sesudah yang pertama
+        // berakhir di sini.
+        if let Some(tx) = guard(&self.h3).as_ref().filter(|tx| !tx.is_closed()) {
+            return Ok(tx.clone());
+        }
+        let _gate = guard(&self.h3_connect);
+        // Cek ulang setelah dapat kunci: worker mungkin sudah dibuat query lain
+        // yang menunggu di depan kita.
+        if let Some(tx) = guard(&self.h3).as_ref().filter(|tx| !tx.is_closed()) {
             return Ok(tx.clone());
         }
         let (tx, rx) = mpsc::channel::<Job>(H3_QUEUE);
@@ -341,7 +461,7 @@ impl Engine {
         let prov = self.prov;
         let cfg = quic_client_config("h3")?;
         tokio::spawn(async move { h3_worker(ep, ep6, cfg, prov, rx).await });
-        *slot = Some(tx.clone());
+        *guard(&self.h3) = Some(tx.clone());
         Ok(tx)
     }
 
@@ -366,10 +486,11 @@ impl Engine {
             .doh
             .ok_or_else(|| "provider tidak punya endpoint DoH".to_string())?;
         let host = url_host(url).to_string();
+        let port = url_port(url);
         let connector = tokio_rustls::TlsConnector::from(tls_config("h2"));
         let mut last = String::from("tidak ada IP bootstrap");
 
-        for addr in boots(self.prov, 443) {
+        for addr in boots(self.prov, port) {
             let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
@@ -409,10 +530,16 @@ impl Engine {
 
     /// Ambil koneksi HTTP/2 yang ada, atau buka yang baru.
     ///
-    /// Satu koneksi HTTP/2 melayani banyak request sekaligus, jadi kunci hanya
-    /// dipegang saat membaca/mengisi slot — bukan selama request berjalan.
-    /// Kalau ditahan, semua query DoH2 mengantre satu per satu.
+    /// Satu koneksi HTTP/2 melayani banyak request sekaligus, jadi slot hanya
+    /// dipegang sebentar. Saat kosong, `h2_connect` dipegang selama handshake
+    /// supaya query yang datang bersamaan tidak sama-sama membuka koneksi —
+    /// yang kedua akan menggantikan yang pertama dan membuang socket hangatnya.
     async fn h2_sender(&self) -> Result<h2::client::SendRequest<Bytes>, String> {
+        if let Some(send) = guard(&self.h2).as_ref() {
+            return Ok(send.clone());
+        }
+        let _gate = self.h2_connect.lock().await;
+        // Cek ulang: koneksi mungkin sudah dibuat query yang menunggu di depan.
         if let Some(send) = guard(&self.h2).as_ref() {
             return Ok(send.clone());
         }
@@ -471,10 +598,15 @@ impl Engine {
         while let Some(chunk) = recv.data().await {
             let mut chunk = chunk.map_err(|e| format!("baca body: {e}"))?;
             let n = chunk.remaining();
-            out.extend_from_slice(&chunk.copy_to_bytes(n));
-            if out.len() > MAX_MESSAGE {
-                break;
+            if out.len() + n > MAX_MESSAGE {
+                return Err("respons DoH melebihi batas".to_string());
             }
+            out.extend_from_slice(&chunk.copy_to_bytes(n));
+            // h2 mewajibkan kapasitas dikembalikan; tanpa ini receive window
+            // habis dan koneksi panjang macet setelah beberapa puluh KiB.
+            recv.flow_control()
+                .release_capacity(n)
+                .map_err(|e| format!("release flow control: {e}"))?;
         }
         Ok(out)
     }
@@ -619,7 +751,8 @@ async fn connect_h3(
 ) -> Result<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>, String> {
     let mut connection = None;
     let mut last = String::from("tidak ada IP bootstrap");
-    for addr in boots(prov, 443) {
+    let port = prov.doh.map(url_port).unwrap_or(443);
+    for addr in boots(prov, port) {
         let endpoint = if addr.is_ipv6() { ep6 } else { Some(ep) };
         let Some(endpoint) = endpoint else {
             last = format!("{addr}: socket IPv6 tidak tersedia");

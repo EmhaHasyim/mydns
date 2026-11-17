@@ -1,4 +1,4 @@
-//! Mode VPN penuh: seluruh trafik IPv4 dibawa lewat tunnel WARP MASQUE.
+//! Mode VPN penuh: seluruh trafik IPv4 dan IPv6 dibawa lewat tunnel WARP MASQUE.
 //!
 //! Transport-nya sama dengan jalur DNS di `warp.rs` — CONNECT-IP (RFC 9484) di
 //! atas HTTP/3. Bedanya hanya sumber paketnya: bukan query DNS yang dibungkus
@@ -15,7 +15,7 @@
 use crate::warp::{self, Tunnel};
 use crate::win;
 use rustls::pki_types::ServerName;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -31,7 +31,11 @@ const RING_CAPACITY: u32 = 0x40_0000;
 /// MTU WARP.
 const MTU_MAX: usize = 1280;
 /// Alamat yang dipakai membuktikan tunnel benar-benar meneruskan trafik.
+/// Keduanya literal, tidak butuh DNS yang sedang dialihkan ke proxy lokal.
 const PROBE_ADDR: &str = "1.1.1.1:443";
+const PROBE_HOST: &str = "1.1.1.1";
+const PROBE_ADDR_V6: &str = "[2606:4700:4700::1111]:443";
+const PROBE_HOST_V6: &str = "2606:4700:4700::1111";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Batas waktu menunggu task pembaca paket berhenti saat tunnel dimatikan.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
@@ -51,7 +55,28 @@ pub struct Vpn {
     routes: win::SavedVpn,
     stats: Arc<Stats>,
     _wintun: Wintun,
+    /// Rute IPv6 ikut dipasang hanya kalau WARP memberi alamat v6.
+    has_v6: bool,
     pub mtu: usize,
+}
+
+async fn tcp_probe(addr: &str) -> Result<(), String> {
+    match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("timeout".to_string()),
+    }
+}
+
+/// Alamat IPv6 dari konfigurasi WARP. API bisa mengembalikan alamat polos atau
+/// dengan prefiks `/128`; keduanya diterima.
+fn tunnel_ipv6(raw: &str) -> Option<String> {
+    raw.trim()
+        .split('/')
+        .next()?
+        .parse::<Ipv6Addr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 impl Vpn {
@@ -66,7 +91,13 @@ impl Vpn {
         let wintun = load_wintun()?;
 
         let tunnel = Tunnel::connect(&config).await?;
-        let mtu = tunnel.max_datagram().saturating_sub(8).clamp(576, MTU_MAX);
+        let ipv6 = tunnel_ipv6(&config.ipv6);
+        // IPv6 mensyaratkan MTU minimal 1280; jangan pernah mengatur adapter
+        // lebih kecil kalau rute v6 ikut dipasang.
+        let mtu = tunnel
+            .max_datagram()
+            .saturating_sub(8)
+            .clamp(if ipv6.is_some() { 1280 } else { 576 }, MTU_MAX);
         let ip: Ipv4Addr = config
             .ipv4
             .parse()
@@ -93,15 +124,20 @@ impl Vpn {
             delete_adapter(&wintun);
             return Err(e);
         }
+        if let Some(ipv6) = ipv6.as_deref()
+            && let Err(e) = win::adapter_set_ipv6(index, ipv6)
+        {
+            let _ = session.shutdown();
+            delete_adapter(&wintun);
+            return Err(e);
+        }
 
+        let endpoint = tunnel.endpoint_ip().map(|ip| ip.to_string());
         let routes = match win::vpn_install_routes(
             ADAPTER_NAME,
             index,
-            tunnel
-                .endpoint_ip()
-                .as_ref()
-                .map(|ip| ip.to_string())
-                .as_deref(),
+            endpoint.as_deref(),
+            ipv6.as_deref(),
         ) {
             Ok(routes) => routes,
             Err(e) => {
@@ -116,7 +152,10 @@ impl Vpn {
         // memilih adapter ini untuk alamat tujuan, baru trafik diuji. Tanpa
         // langkah ini probe bisa gagal dengan "unreachable host" walau
         // rutenya benar.
-        wait_route_active(index, PROBE_ADDR).await;
+        wait_route_active(index, PROBE_HOST).await;
+        if ipv6.is_some() {
+            wait_route_active(index, PROBE_HOST_V6).await;
+        }
 
         let (stop_tx, _) = watch::channel(false);
         let stats = Arc::new(Stats::default());
@@ -133,6 +172,7 @@ impl Vpn {
             routes,
             stats,
             _wintun: wintun,
+            has_v6: ipv6.is_some(),
             mtu,
         };
 
@@ -150,15 +190,14 @@ impl Vpn {
         let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
         let mut last = "timeout".to_string();
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(
-                Duration::from_secs(2),
-                tokio::net::TcpStream::connect(PROBE_ADDR),
-            )
-            .await
+            if let Err(e) = tcp_probe(PROBE_ADDR).await {
+                last = e;
+            } else if self.has_v6
+                && let Err(e) = tcp_probe(PROBE_ADDR_V6).await
             {
-                Ok(Ok(_)) => return Ok(()),
-                Ok(Err(e)) => last = e.to_string(),
-                Err(_) => last = "timeout".to_string(),
+                last = format!("IPv6: {e}");
+            } else {
+                return Ok(());
             }
             // Percobaan pertama bisa kalah cepat dari pembaruan tabel rute;
             // ulangi selama masih ada waktu.
@@ -302,7 +341,7 @@ fn spawn_writer(
     stats: &Arc<Stats>,
     stop: &watch::Sender<bool>,
 ) -> JoinHandle<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
     tunnel.set_raw_sink(tx);
     let session = Arc::clone(session);
     let stats = Arc::clone(stats);
@@ -382,11 +421,7 @@ fn configure_adapter(adapter: &Arc<Adapter>, ip: Ipv4Addr, mtu: usize) -> Result
 /// Tunggu sampai stack Windows benar-benar memilih adapter kita untuk alamat
 /// tujuan. `Find-NetRoute` membaca tabel rute yang sama dengan yang dipakai
 /// pengiriman paket, jadi ini bukti yang tepat — bukan sekadar status adapter.
-async fn wait_route_active(index: u32, destination: &str) {
-    let host = destination
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(destination);
+async fn wait_route_active(index: u32, host: &str) {
     for _ in 0..20 {
         let script = format!(
             "$r = Find-NetRoute -RemoteIPAddress {host} -ErrorAction SilentlyContinue | Select-Object -First 1; if ($r) {{ \"$($r.InterfaceIndex)\" }} else {{ '0' }}"
@@ -435,6 +470,32 @@ fn delete_adapter(wintun: &Wintun) {
     }
 }
 
+/// SHA-256 dari `assets/wintun.dll` yang dibundel. Memuat DLL dari folder yang
+/// bisa ditulis user tanpa pin hash berarti user lokal bisa menanam DLL dan
+/// mendapat eksekusi kode saat VPN dinyalakan elevated.
+const WINTUN_SHA256: &str = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce";
+
+fn verify_wintun(path: &std::path::Path) -> Result<(), String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("tidak bisa membaca {}: {e}", path.display()))?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let actual = digest
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        });
+    if actual != WINTUN_SHA256 {
+        return Err(format!(
+            "{} bukan wintun.dll yang dibundel (sha256 {actual})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Wintun adalah driver pihak ketiga, jadi DLL-nya dicari berurutan: di samping
 /// `mydns.exe`, di subfolder `assets`, lalu folder proyek saat dijalankan lewat
 /// `cargo run`.
@@ -456,9 +517,28 @@ fn load_wintun() -> Result<Wintun, String> {
         if !path.exists() {
             continue;
         }
-        // Aman: berkas yang dimuat adalah DLL yang disertakan bersama program.
+        verify_wintun(&path)?;
         return unsafe { wintun::load_from_path(&path) }
             .map_err(|e| format!("gagal memuat {}: {e}", path.display()));
     }
     Err("wintun.dll tidak ditemukan — letakkan di folder yang sama dengan mydns.exe".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alamat_ipv6_warp_menerima_prefiks() {
+        assert_eq!(
+            tunnel_ipv6("2606:4700:110:8a1b::1/128").as_deref(),
+            Some("2606:4700:110:8a1b::1")
+        );
+        assert_eq!(
+            tunnel_ipv6(" 2606:4700:110::2 ").as_deref(),
+            Some("2606:4700:110::2")
+        );
+        assert_eq!(tunnel_ipv6(""), None);
+        assert_eq!(tunnel_ipv6("1.2.3.4"), None);
+    }
 }

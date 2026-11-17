@@ -611,8 +611,13 @@ fn cmd_vpn(args: &[String], mode: &str, dns_provider: Option<&str>) {
             let outcome: Result<(), String> = rt.block_on(async {
                 let before = vpn::exit_ip().await.unwrap_or_else(|_| "-".to_string());
                 let tunnel = vpn::Vpn::up().await?;
+                let families = if tunnel.routes().ipv6.is_empty() {
+                    "IPv4"
+                } else {
+                    "IPv4 + IPv6"
+                };
                 println!(
-                    "VPN aktif — seluruh trafik IPv4 lewat WARP (MTU {}, {} rute)",
+                    "VPN aktif — seluruh trafik {families} lewat WARP (MTU {}, {} rute)",
                     tunnel.mtu,
                     tunnel.routes().routes.len()
                 );

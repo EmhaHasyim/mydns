@@ -4,41 +4,46 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_LINES: usize = 200;
 
 pub struct Log {
-    buf: Mutex<VecDeque<String>>,
+    buf: Mutex<Arc<VecDeque<Arc<str>>>>,
 }
 
 impl Log {
     pub fn new() -> Self {
         Self {
-            buf: Mutex::new(VecDeque::new()),
+            buf: Mutex::new(Arc::new(VecDeque::new())),
         }
     }
 
     /// Poison diabaikan: buffer hanya berisi teks, dan log tidak boleh ikut
     /// membuat proses panik saat dibaca.
-    fn lines(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+    fn lines(&self) -> std::sync::MutexGuard<'_, Arc<VecDeque<Arc<str>>>> {
         self.buf
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn push(&self, line: impl Into<String>) {
+        let line: Arc<str> = Arc::from(line.into());
         let mut buf = self.lines();
-        buf.push_back(line.into());
-        while buf.len() > MAX_LINES {
-            buf.pop_front();
+        // Salin-dan-tulis: pembaca TUI memegang `Arc` dari buffer lama tanpa
+        // ikut mengunci, dan `make_mut` tidak meng-clone 200 entri kalau tidak
+        // ada pembaca yang masih memakai snapshot.
+        let next = Arc::make_mut(&mut buf);
+        next.push_back(line);
+        while next.len() > MAX_LINES {
+            next.pop_front();
         }
     }
 
     /// Salinan baris terlama → terbaru, untuk panel log di TUI.
-    pub fn snapshot(&self) -> Vec<String> {
-        self.lines().iter().cloned().collect()
+    pub fn snapshot(&self) -> Arc<VecDeque<Arc<str>>> {
+        Arc::clone(&self.lines())
     }
 }
 
@@ -104,7 +109,8 @@ fn timestamp() -> String {
 }
 
 /// Tanggal kalender dari jumlah hari sejak 1970-01-01 (algoritma Howard Hinnant).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+/// Dipakai juga oleh `warp.rs` untuk menyusun tanggal sertifikat.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

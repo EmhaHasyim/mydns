@@ -18,6 +18,48 @@ use tokio::sync::{mpsc, watch};
 /// Nama pipe. Satu daemon per sesi pengguna.
 pub const PIPE: &str = r"\\.\pipe\mydns-daemon";
 
+/// DACL eksplisit untuk pipe: pemilik pipe (user yang menjalankan daemon),
+/// SYSTEM, dan Administrators. Tanpa ini pipe memakai default DACL token, yang
+/// bisa memberi user lain akses ke perintah `stop`/`restore`.
+fn create_pipe(first: bool) -> std::io::Result<NamedPipeServer> {
+    create_pipe_named(first, PIPE)
+}
+
+fn create_pipe_named(first: bool, name: &str) -> std::io::Result<NamedPipeServer> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first);
+
+    const SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
+    let sddl: Vec<u16> = SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sd: *mut c_void = std::ptr::null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 || sd.is_null() {
+        return options.create(name);
+    }
+    let mut attrs = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd,
+        bInheritHandle: 0,
+    };
+    let result = unsafe {
+        options.create_with_security_attributes_raw(name, &mut attrs as *mut _ as *mut c_void)
+    };
+    unsafe { LocalFree(sd) };
+    result
+}
+
 #[derive(Debug)]
 enum Command {
     Restore,
@@ -74,7 +116,7 @@ pub fn control(command: &str) -> Result<String, String> {
 async fn serve(provider: &'static providers::Provider) -> Result<(), String> {
     // Instance pertama dipegang terus: nama pipe tetap terpakai selama daemon
     // hidup, sehingga daemon kedua ditolak alih-alih berebut port 53.
-    let first = match ServerOptions::new().first_pipe_instance(true).create(PIPE) {
+    let first = match create_pipe(true) {
         Ok(server) => server,
         Err(e) => {
             return Err(format!(
@@ -180,7 +222,7 @@ async fn pipe_loop(
     loop {
         let mut server = match next.take() {
             Some(server) => server,
-            None => match ServerOptions::new().create(PIPE) {
+            None => match create_pipe(false) {
                 Ok(server) => server,
                 Err(e) => {
                     eprintln!("pipe: tidak bisa membuat instance: {e}");
@@ -229,5 +271,22 @@ async fn pipe_loop(
 
         let _ = server.write_all(format!("{reply}\n").as_bytes()).await;
         let _ = server.flush().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DACL pipe harus tetap mengizinkan pemilik pipe membuka
+    /// `mydns control`. SDDL yang salah membuat daemon tidak bisa dikendalikan
+    /// sama sekali, jadi jalur ini layak diuji di Windows sungguhan.
+    #[tokio::test]
+    async fn pipe_bisa_dibuka_user_yang_sama() {
+        let name = format!(r"\\.\pipe\mydns-test-{}", std::process::id());
+        let server = create_pipe_named(true, &name).unwrap();
+        let client = ClientOptions::new().open(&name).unwrap();
+        server.connect().await.unwrap();
+        drop(client);
     }
 }

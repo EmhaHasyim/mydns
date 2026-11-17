@@ -24,3 +24,30 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Release build
+        run: cargo build --release
+
+  # Versi minimum di Cargo.toml harus benar-benar bisa membangun proyek.
+  msrv:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check
+        run: cargo check --all-targets
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

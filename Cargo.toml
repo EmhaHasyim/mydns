@@ -2,7 +2,7 @@
 name = "mydns"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Pengalih DNS Windows 11 ke DoQ/DoH3 lewat proxy loopback, dengan TUI dan pemulihan otomatis"
 repository = "https://github.com/EmhaHasyim/mydns"
 readme = "README.md"
@@ -34,11 +34,16 @@ webpki-roots = "1.0.12"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

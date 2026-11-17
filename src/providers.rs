@@ -184,9 +184,19 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn read_config() -> Config {
-    match std::fs::read_to_string(config_path()) {
+    let path = config_path();
+    match std::fs::read_to_string(&path) {
         Ok(text) => parse(&text),
-        Err(_) => Config::default(),
+        // Berkas tidak ada adalah kondisi normal: katalog bawaan tetap dipakai.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(e) => {
+            let message = format!("{} tidak bisa dibaca: {e}", path.display());
+            crate::log::event(&message);
+            Config {
+                entries: Vec::new(),
+                errors: vec![message],
+            }
+        }
     }
 }
 
@@ -264,6 +274,11 @@ fn parse_line(line: &str) -> Result<Entry, String> {
 
     if doq.is_none() && doh.is_none() {
         return Err("butuh minimal satu endpoint DoQ atau DoH".to_string());
+    }
+    // Tanpa IP bootstrap, hostname resolver harus di-resolve lewat DNS sistem —
+    // yang setelah pengalihan menunjuk balik ke proxy kita (loop).
+    if boot.is_empty() {
+        return Err("butuh minimal satu IP bootstrap di kolom boot".to_string());
     }
 
     Ok(Entry {

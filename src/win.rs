@@ -3,9 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Proses anak (powershell, ipconfig, schtasks) tidak boleh memunculkan jendela
 /// hitam, terutama kalau kita sendiri sudah tidak punya konsol.
@@ -59,36 +61,189 @@ pub struct SavedVpn {
     pub adapter: String,
     pub endpoint: String,
     pub routes: Vec<SavedRoute>,
+    /// Alamat IPv6 yang dipasang di adapter. Kosong kalau WARP tidak memberi
+    /// alamat v6 atau jalur v6 tidak tersedia.
+    #[serde(default)]
+    pub ipv6: String,
+}
+
+/// Folder state. `SHGetKnownFolderPath` tidak bisa dibelokkan lewat environment
+/// seperti `%ProgramData%`, jadi user lokal tidak bisa mengarahkan state ke
+/// folder miliknya sebelum proses elevated menulis.
+fn program_data() -> PathBuf {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+
+    let mut ptr: *mut u16 = std::ptr::null_mut();
+    let hr =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut ptr) };
+    if hr >= 0 && !ptr.is_null() {
+        let path = unsafe { wide_string(ptr) };
+        unsafe { CoTaskMemFree(ptr as *const std::ffi::c_void) };
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+    PathBuf::from(base)
 }
 
 pub fn state_path() -> PathBuf {
-    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
-    PathBuf::from(base).join("MyDns").join("state.json")
+    program_data().join("MyDns").join("state.json")
+}
+
+/// State hanya boleh berisi alamat IP yang valid. Ini pertahanan kedua setelah
+/// escaping: nilai aneh tidak pernah mencapai skrip PowerShell elevated.
+fn state_valid(s: &Saved) -> bool {
+    let ifaces_ok = s.ifaces.values().all(|iface| {
+        iface
+            .v4
+            .iter()
+            .chain(iface.v6.iter())
+            .all(|server| server.parse::<IpAddr>().is_ok())
+    });
+    let vpn_ok = s.vpn.as_ref().is_none_or(|vpn| {
+        vpn.routes.iter().all(|route| {
+            let Some((ip, prefix)) = route.dest.split_once('/') else {
+                return false;
+            };
+            let (Ok(ip), Ok(prefix)) = (ip.parse::<IpAddr>(), prefix.parse::<u8>()) else {
+                return false;
+            };
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            prefix <= max && route.nexthop.parse::<IpAddr>().is_ok()
+        })
+    });
+    ifaces_ok && vpn_ok
 }
 
 pub fn load_state() -> Option<Saved> {
     let raw = std::fs::read_to_string(state_path()).ok()?;
-    serde_json::from_str(&raw).ok()
+    let saved: Saved = serde_json::from_str(&raw).ok()?;
+    if !state_valid(&saved) {
+        crate::log::event("state.json berisi nilai yang tidak valid — diabaikan");
+        return None;
+    }
+    Some(saved)
+}
+
+/// Buat direktori state hanya bisa ditulis SYSTEM/Administrators. Authenticated
+/// Users tetap bisa membaca untuk `mydns status`, tetapi tidak bisa menanam
+/// state palsu yang nanti dijalankan proses elevated.
+fn harden_state_dir(dir: &Path) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+    };
+
+    const SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;AU)";
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide(SDDL).as_ptr(),
+            1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "tidak bisa menyusun ACL state: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let ok = unsafe {
+        SetFileSecurityW(
+            wide_os(dir.as_os_str()).as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            sd,
+        )
+    };
+    unsafe { LocalFree(sd) };
+    if ok == 0 {
+        return Err(format!(
+            "tidak bisa mengamankan {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn wide_os(value: &std::ffi::OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn move_replace(from: &Path, to: &Path) -> Result<(), String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let ok = unsafe {
+        MoveFileExW(
+            wide_os(from.as_os_str()).as_ptr(),
+            wide_os(to.as_os_str()).as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(format!(
+            "tidak bisa mengganti {}: {}",
+            to.display(),
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn save_state(s: &Saved) -> Result<(), String> {
     let path = state_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("gagal membuat {}: {e}", dir.display()))?;
-    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| "path state tidak valid".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("gagal membuat {}: {e}", dir.display()))?;
+    harden_state_dir(dir)?;
     let raw = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
-    std::fs::write(&path, raw).map_err(|e| format!("gagal menulis {}: {e}", path.display()))
+    // Tulis ke file sementara di direktori yang sama, fsync, lalu ganti secara
+    // atomik. Crash di tengah penulisan tidak boleh meninggalkan JSON korup
+    // yang membuat restore melewati pemulihan DNS.
+    let tmp = path.with_extension("json.tmp");
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("gagal menulis {}: {e}", tmp.display()))?;
+    use std::io::Write;
+    file.write_all(raw.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("gagal menulis {}: {e}", tmp.display()))?;
+    drop(file);
+    if let Err(e) = move_replace(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn clear_state() {
     let _ = std::fs::remove_file(state_path());
 }
 
+/// Path executable sistem tanpa bergantung pada PATH/current directory.
+/// Proses ini sering berjalan elevated; `Command::new("powershell")` bisa
+/// menemukan file yang ditanam di folder aplikasi atau CWD.
+pub(crate) fn system32_exe(name: &str) -> PathBuf {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 || len as usize >= buf.len() {
+        return PathBuf::from(r"C:\Windows\System32").join(name);
+    }
+    PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])).join(name)
+}
+
 pub(crate) fn run_ps(script: &str) -> Result<String, String> {
     // Paksa UTF-8 supaya nama adapter non-ASCII tidak muncul sebagai mojibake.
     let full = format!("$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8\n{script}");
-    let out = Command::new("powershell")
+    let out = Command::new(system32_exe(r"WindowsPowerShell\v1.0\powershell.exe"))
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -329,9 +484,43 @@ fn split_list(value: Option<&serde_json::Value>) -> Vec<String> {
 fn quote_list(values: &[String]) -> String {
     values
         .iter()
-        .map(|v| format!("'{v}'"))
+        .map(|v| ps_quote(v))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn json_count(value: Option<&serde_json::Value>) -> usize {
+    match value {
+        Some(serde_json::Value::Array(items)) => items.len(),
+        Some(serde_json::Value::String(text)) if !text.is_empty() => 1,
+        Some(serde_json::Value::Number(_)) => 1,
+        _ => 0,
+    }
+}
+
+fn verify_applied(adapters: &[Adapter], listen_v6: bool) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        match list_adapters() {
+            Ok(now) => {
+                if let Some(missing) = adapters.iter().find(|saved| {
+                    now.iter().find(|a| a.index == saved.index).is_none_or(|a| {
+                        !a.v4.iter().any(|server| server == "127.0.0.1")
+                            || (listen_v6 && !a.v6.iter().any(|server| server == "::1"))
+                    })
+                }) {
+                    last = format!("adapter {} belum memakai proxy loopback", missing.index);
+                } else {
+                    return Ok(());
+                }
+            }
+            Err(e) => last = e,
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Err(format!("verifikasi DNS gagal: {last}"))
 }
 
 fn now_secs() -> u64 {
@@ -378,8 +567,8 @@ pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String>
         ));
         if listen_v6 {
             script.push_str(&format!(
-                "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '::1' -ErrorAction Stop }} catch {{ }}\n",
-                a.index
+                "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '::1' -ErrorAction Stop }} catch {{ $bad += \"{} v6: $($_.Exception.Message)\" }}\n",
+                a.index, a.index
             ));
         }
     }
@@ -387,18 +576,17 @@ pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String>
 
     let raw = run_ps(&script)?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-    // ConvertTo-Json bisa menghasilkan array atau nilai tunggal tergantung
-    // jumlah adapter, jadi keduanya harus diterima.
-    let ok_count = match parsed.get("ok") {
-        Some(serde_json::Value::Array(items)) => items.len(),
-        Some(serde_json::Value::String(text)) if !text.is_empty() => 1,
-        Some(serde_json::Value::Number(_)) => 1,
-        _ => 0,
-    };
-    if ok_count == 0 {
-        let bad = raw;
-        return Err(format!("gagal mengubah DNS adapter: {bad}"));
+    let ok_count = json_count(parsed.get("ok"));
+    let bad_count = json_count(parsed.get("bad"));
+    if ok_count != adapters.len() || bad_count > 0 {
+        return Err(format!(
+            "gagal mengubah DNS pada {} adapter (berhasil {}, gagal {}): {raw}",
+            adapters.len(),
+            ok_count,
+            bad_count
+        ));
     }
+    verify_applied(&adapters, listen_v6)?;
 
     flush_dns();
     Ok(adapters)
@@ -426,7 +614,11 @@ fn restore_plan(saved: Option<&Saved>, adapters: &[Adapter]) -> (String, usize) 
                 let index = saved_index
                     .parse::<u32>()
                     .ok()
-                    .filter(|index| by_index.contains_key(index))
+                    .filter(|index| {
+                        by_index
+                            .get(index)
+                            .is_some_and(|adapter| adapter.name == iface.name)
+                    })
                     .or_else(|| by_name.get(iface.name.as_str()).copied());
                 let Some(index) = index else { continue };
 
@@ -480,6 +672,13 @@ pub fn restore() -> Result<String, String> {
     let saved = load_state();
     let adapters = list_adapters()?;
     let (script, touched) = restore_plan(saved.as_ref(), &adapters);
+    // Kalau state ada tetapi tidak ada adapter yang cocok (index/nama berubah),
+    // jangan menyerah: reset adapter yang masih menunjuk loopback.
+    let (script, touched) = if touched == 0 {
+        restore_plan(None, &adapters)
+    } else {
+        (script, touched)
+    };
 
     if touched == 0 {
         clear_state();
@@ -490,8 +689,25 @@ pub fn restore() -> Result<String, String> {
 
     run_ps(&script)?;
     flush_dns();
+    // Jangan hapus state kalau verifikasi gagal: ini satu-satunya catatan
+    // untuk mencoba lagi.
+    verify_restored()?;
     clear_state();
     Ok(format!("DNS dipulihkan pada {touched} adapter"))
+}
+
+fn verify_restored() -> Result<(), String> {
+    let adapters = list_adapters()?;
+    if let Some(stuck) = adapters
+        .iter()
+        .find(|a| a.v4.iter().any(|s| s == "127.0.0.1") || a.v6.iter().any(|s| s == "::1"))
+    {
+        return Err(format!(
+            "DNS adapter {} masih menunjuk loopback setelah restore",
+            stuck.index
+        ));
+    }
+    Ok(())
 }
 
 /// True kalau ada adapter aktif yang DNS-nya tidak lagi menunjuk proxy lokal.
@@ -529,9 +745,11 @@ pub fn port53_v6_free() -> bool {
 /// port 53. Dipakai saat logon dan oleh watchdog: kalau pengguna sudah membuka
 /// sesi baru, DNS milik sesi itu tidak boleh ditimpa.
 pub fn restore_if_stale() -> Result<Option<String>, String> {
-    if load_state().is_none() || !port53_free() {
+    if !port53_free() {
         return Ok(None);
     }
+    // State hilang/korup bukan alasan untuk meninggalkan adapter di loopback:
+    // restore_plan(None) mereset adapter yang masih menunjuk 127.0.0.1/::1.
     restore().map(Some)
 }
 
@@ -559,6 +777,48 @@ if ($r) { [pscustomobject]@{ iface = "$($r.ifIndex)"; hop = "$($r.NextHop)" } | 
     Ok((iface, hop))
 }
 
+/// Gateway IPv6 default yang sedang dipakai. Sama seperti `default_route`, tapi
+/// diperlukan kalau endpoint QUIC WARP yang dipilih beralamat IPv6 — paket ke
+/// endpoint itu tidak boleh ikut masuk tunnel.
+pub fn default_route_v6() -> Result<(u32, String), String> {
+    let raw = run_ps(
+        r#"$r = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -ne '::' } | Sort-Object RouteMetric | Select-Object -First 1
+if ($r) { [pscustomobject]@{ iface = "$($r.ifIndex)"; hop = "$($r.NextHop)" } | ConvertTo-Json -Compress } else { '{}' }"#,
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("gateway IPv6 default tidak terbaca: {e}"))?;
+    let iface = value
+        .get("iface")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(|| "tidak ada gateway IPv6 default yang aktif".to_string())?;
+    let hop = value
+        .get("hop")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // PowerShell bisa mengembalikan `fe80::1%12` (zone id). `New-NetRoute`
+    // sudah menerima interface lewat `-InterfaceIndex`, jadi buang suffix-nya
+    // — kalau tidak, validasi state.json menolak rute ini.
+    let hop = hop.split('%').next().unwrap_or(&hop).to_string();
+    if hop.is_empty() {
+        return Err("gateway IPv6 default tidak punya next-hop".to_string());
+    }
+    Ok((iface, hop))
+}
+
+/// Pasang alamat IPv6 WARP pada adapter TUN. Wintun crate hanya mengatur IPv4,
+/// jadi ini lewat cmdlet bawaan Windows. Prefix /128 karena alamat tunnel
+/// adalah titik ujung, bukan subnet.
+pub fn adapter_set_ipv6(index: u32, ip: &str) -> Result<(), String> {
+    let script = format!(
+        "New-NetIPAddress -InterfaceIndex {index} -IPAddress {} -PrefixLength 128 -AddressFamily IPv6 -ErrorAction Stop | Out-Null",
+        ps_quote(ip)
+    );
+    run_ps(&script)?;
+    Ok(())
+}
+
 /// Rute yang membentuk full tunnel, dipisah dari eksekusi supaya isinya bisa
 /// diuji tanpa menyentuh tabel rute Windows.
 ///
@@ -568,13 +828,19 @@ pub fn vpn_route_plan(
     index: u32,
     endpoint: Option<&str>,
     physical: Option<(u32, String)>,
+    ipv6: Option<&str>,
 ) -> Result<Vec<SavedRoute>, String> {
     let mut routes = Vec::new();
     if let Some(ip) = endpoint.map(str::trim).filter(|ip| !ip.is_empty()) {
+        let parsed: IpAddr = ip
+            .parse()
+            .map_err(|_| format!("endpoint VPN tidak valid: {ip}"))?;
+        let family = if parsed.is_ipv4() { "IPv4" } else { "IPv6" };
         let (phys_index, hop) =
-            physical.ok_or_else(|| "tidak ada gateway IPv4 default yang aktif".to_string())?;
+            physical.ok_or_else(|| format!("tidak ada gateway {family} default yang aktif"))?;
+        let prefix = if parsed.is_ipv4() { 32 } else { 128 };
         routes.push(SavedRoute {
-            dest: format!("{ip}/32"),
+            dest: format!("{ip}/{prefix}"),
             iface: phys_index,
             nexthop: hop,
         });
@@ -585,6 +851,15 @@ pub fn vpn_route_plan(
             iface: index,
             nexthop: "0.0.0.0".to_string(),
         });
+    }
+    if ipv6.is_some_and(|ip| !ip.trim().is_empty()) {
+        for dest in ["::/1", "8000::/1"] {
+            routes.push(SavedRoute {
+                dest: dest.to_string(),
+                iface: index,
+                nexthop: "::".to_string(),
+            });
+        }
     }
     Ok(routes)
 }
@@ -602,20 +877,29 @@ pub fn vpn_install_routes(
     adapter: &str,
     index: u32,
     endpoint: Option<&str>,
+    ipv6: Option<&str>,
 ) -> Result<SavedVpn, String> {
     require_admin()?;
-    // Gateway asli hanya dibutuhkan kalau ada endpoint yang harus dikeluarkan
-    // dari tunnel.
+    // Gateway asli dibutuhkan kalau endpoint WARP harus dikeluarkan dari
+    // tunnel. Keluarganya (v4/v6) mengikuti alamat endpoint yang dipakai QUIC.
     let physical = if endpoint.is_some_and(|ip| !ip.trim().is_empty()) {
-        Some(default_route()?)
+        let is_v6 = endpoint
+            .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
+            .is_some_and(|ip| ip.is_ipv6());
+        Some(if is_v6 {
+            default_route_v6()?
+        } else {
+            default_route()?
+        })
     } else {
         None
     };
-    let routes = vpn_route_plan(index, endpoint, physical)?;
+    let routes = vpn_route_plan(index, endpoint, physical, ipv6)?;
 
     let saved = SavedVpn {
         adapter: adapter.to_string(),
         endpoint: endpoint.unwrap_or("").to_string(),
+        ipv6: ipv6.unwrap_or("").to_string(),
         routes: routes.clone(),
     };
     let mut state = load_state().unwrap_or_default();
@@ -718,6 +1002,9 @@ pub fn spawn_watchdog() {
 /// memulihkan DNS padahal hanya ada gangguan sesaat jauh lebih merugikan
 /// daripada satu pemeriksaan tambahan di jalur kegagalan.
 pub fn verify_resolution() -> Result<(), String> {
+    // Buang jawaban lama dari cache Windows sebelum mengukur; tanpa ini
+    // `example.com` yang sudah di-cache membuat verifikasi lulus palsu.
+    flush_dns();
     if system_resolves("example.com") {
         return Ok(());
     }
@@ -738,7 +1025,7 @@ fn system_resolves(host: &str) -> bool {
 
 /// Apakah pemulihan otomatis saat logon sudah terdaftar.
 pub fn autostart_enabled() -> bool {
-    Command::new("schtasks")
+    Command::new(system32_exe("schtasks.exe"))
         .args(["/Query", "/TN", TASK_NAME])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -751,7 +1038,7 @@ pub fn autostart_enabled() -> bool {
 /// peringatan palsu hanya karena format keluaran schtasks berbeda.
 pub fn autostart_target_valid() -> Option<bool> {
     let exe = std::env::current_exe().ok()?.to_string_lossy().to_string();
-    let out = Command::new("schtasks")
+    let out = Command::new(system32_exe("schtasks.exe"))
         .args(["/Query", "/TN", TASK_NAME, "/XML"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -787,7 +1074,7 @@ pub fn autostart_set(enabled: bool) -> Result<String, String> {
     let output = if enabled {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let action = format!("\"{}\" restore --if-stale", exe.display());
-        Command::new("schtasks")
+        Command::new(system32_exe("schtasks.exe"))
             .args([
                 "/Create", "/F", "/SC", "ONLOGON", "/RL", "HIGHEST", "/DELAY", "0000:15", "/TN",
                 TASK_NAME, "/TR", &action,
@@ -795,7 +1082,7 @@ pub fn autostart_set(enabled: bool) -> Result<String, String> {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
     } else {
-        Command::new("schtasks")
+        Command::new(system32_exe("schtasks.exe"))
             .args(["/Delete", "/F", "/TN", TASK_NAME])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
@@ -814,7 +1101,7 @@ pub fn autostart_set(enabled: bool) -> Result<String, String> {
 }
 
 pub fn flush_dns() {
-    let _ = Command::new("ipconfig")
+    let _ = Command::new(system32_exe("ipconfig.exe"))
         .arg("/flushdns")
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -881,9 +1168,21 @@ pub fn is_elevated() -> bool {
 
 /// Dipanggil Windows saat jendela konsol ditutup, logoff, atau Ctrl+C.
 /// Tanpa ini, menutup terminal bisa meninggalkan DNS menunjuk ke proxy mati.
+/// Restore blocking tidak boleh dijalankan di handler: Windows hanya memberi
+/// beberapa detik sebelum mematikan proses. Jalankan proses restore terpisah.
+static EXIT_RESTORE_STARTED: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "system" fn exit_handler(_ctrl_type: u32) -> i32 {
-    if load_state().is_some() {
-        let _ = restore();
+    if EXIT_RESTORE_STARTED.swap(true, Ordering::SeqCst) {
+        return 1;
+    }
+    if load_state().is_some()
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let _ = Command::new(exe)
+            .arg("restore")
+            .creation_flags(DETACHED_PROCESS)
+            .spawn();
     }
     1
 }
@@ -942,6 +1241,48 @@ pub fn relaunch_elevated(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn acl_direktori_state_bisa_dipasang() {
+        let dir = std::env::temp_dir().join(format!("mydns-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = harden_state_dir(&dir);
+        // Kembalikan ACL turunan sebelum menghapus: direktori ini sengaja
+        // dibuat tidak bisa dihapus oleh user biasa setelah diperketat.
+        let _ = Command::new(system32_exe("icacls.exe"))
+            .args([dir.as_os_str(), std::ffi::OsStr::new("/reset")])
+            .arg("/T")
+            .arg("/C")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn state_menerima_rute_ipv6() {
+        let state = Saved {
+            vpn: Some(SavedVpn {
+                adapter: "MyDNS".to_string(),
+                endpoint: "2606:4700:103::1".to_string(),
+                ipv6: "2606:4700:110::1".to_string(),
+                routes: vec![
+                    SavedRoute {
+                        dest: "::/1".to_string(),
+                        iface: 5,
+                        nexthop: "::".to_string(),
+                    },
+                    SavedRoute {
+                        dest: "2606:4700:103::1/128".to_string(),
+                        iface: 3,
+                        nexthop: "fe80::1".to_string(),
+                    },
+                ],
+            }),
+            ..Saved::default()
+        };
+        assert!(state_valid(&state));
+    }
+
     fn adapter(index: u32, name: &str, v4: &[&str], v6: &[&str]) -> Adapter {
         Adapter {
             index,
@@ -957,6 +1298,7 @@ mod tests {
             49,
             Some("162.159.198.2"),
             Some((18, "192.168.1.1".to_string())),
+            None,
         )
         .unwrap();
         assert_eq!(routes.len(), 3);
@@ -976,7 +1318,7 @@ mod tests {
 
     #[test]
     fn rencana_rute_vpn_tanpa_endpoint() {
-        let routes = vpn_route_plan(7, None, None).unwrap();
+        let routes = vpn_route_plan(7, None, None, None).unwrap();
         assert_eq!(routes.len(), 2);
         assert!(routes.iter().all(|route| route.iface == 7));
     }
@@ -985,7 +1327,31 @@ mod tests {
     fn rencana_rute_vpn_butuh_gateway_untuk_endpoint() {
         // Tanpa gateway asli, host route ke endpoint tidak bisa dipasang —
         // dan full tunnel tanpa itu akan memutar koneksi QUIC ke dirinya sendiri.
-        assert!(vpn_route_plan(7, Some("162.159.198.2"), None).is_err());
+        assert!(vpn_route_plan(7, Some("162.159.198.2"), None, None).is_err());
+    }
+
+    #[test]
+    fn rencana_rute_vpn_ipv6_mengeluarkan_endpoint_lewat_gateway_v6() {
+        let routes = vpn_route_plan(
+            12,
+            Some("2606:4700:103::1"),
+            Some((9, "fe80::1".to_string())),
+            Some("2606:4700:110:8a1b::1"),
+        )
+        .unwrap();
+        assert_eq!(routes.len(), 5);
+        assert_eq!(
+            routes[0],
+            SavedRoute {
+                dest: "2606:4700:103::1/128".to_string(),
+                iface: 9,
+                nexthop: "fe80::1".to_string(),
+            }
+        );
+        assert_eq!(routes[3].dest, "::/1");
+        assert_eq!(routes[4].dest, "8000::/1");
+        assert!(routes[3..].iter().all(|route| route.iface == 12));
+        assert!(routes[3..].iter().all(|route| route.nexthop == "::"));
     }
 
     fn saved(index: &str, name: &str, v4: &[&str]) -> Saved {

@@ -23,6 +23,9 @@ pub const ADDR_V6: &str = "[::1]:53";
 /// (masih TTL asli) tidak membuat data basi terlalu lama.
 const MAX_CACHE_SECS: u32 = 60;
 const MAX_CACHE_ITEMS: usize = 4096;
+/// Jawaban besar (mis. DNSSEC penuh) tidak layak disimpan: 4096 entri × 64 KiB
+/// bisa memakan ratusan MB. Jawaban normal hampir selalu jauh di bawah ini.
+const MAX_CACHE_ENTRY_BYTES: usize = 16 * 1024;
 /// Batas menunggu gerbang single-flight. Kalau pemegangnya macet (mis. upstream
 /// menggantung), query lain diteruskan sendiri daripada ikut menunggu sampai
 /// klien kehabisan waktu.
@@ -43,7 +46,9 @@ struct Key {
 }
 
 struct Entry {
-    bytes: Vec<u8>,
+    /// Jawaban mentah. `Arc` supaya cache hit tidak mengalokasikan ulang
+    /// salinan paket — yang dikirim ke klien hanya 2 byte ID di header.
+    bytes: Arc<[u8]>,
     expires: Instant,
 }
 
@@ -72,6 +77,7 @@ fn cache_key(question: &hickory_proto::op::Query, message: &Message) -> Key {
 /// jawabannya bergantung pada pengirim atau izin, jadi tidak boleh dibagikan.
 fn is_cacheable(message: &Message, question: &hickory_proto::op::Query) -> bool {
     message.metadata.op_code == OpCode::Query
+        && message.metadata.recursion_desired
         && message.queries.len() == 1
         && message.signature.is_none()
         && !matches!(question.query_type(), RecordType::AXFR | RecordType::IXFR)
@@ -149,12 +155,11 @@ impl Proxy {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.log_query(&name, qtype, "cache", 0);
             return Some(fit_udp(
-                cached_response(&bytes, id, remaining),
+                cached_response(&bytes, id, remaining, question),
                 &parsed,
                 over_tcp,
             ));
         }
-
         self.misses.fetch_add(1, Ordering::Relaxed);
 
         if !cacheable {
@@ -171,7 +176,7 @@ impl Proxy {
         let response = match self.cache_get(&key).await {
             Some((bytes, remaining)) => {
                 self.log_query(&name, qtype, "gabung", 0);
-                cached_response(&bytes, id, remaining)
+                cached_response(&bytes, id, remaining, question)
             }
             None => self.forward(request, &key, &name, qtype).await,
         };
@@ -201,7 +206,10 @@ impl Proxy {
     /// Ambil entri cache yang masih hidup beserta sisa umurnya dalam detik.
     /// Sisa umur dipakai untuk menurunkan TTL yang dikirim ke klien, supaya
     /// klien tidak menyimpan rekaman lebih lama daripada cache kita.
-    async fn cache_get(&self, key: &Key) -> Option<(Vec<u8>, u32)> {
+    ///
+    /// Yang dikembalikan adalah `Arc` dari paket asli: tidak ada alokasi ulang
+    /// di jalur cache hit.
+    async fn cache_get(&self, key: &Key) -> Option<(Arc<[u8]>, u32)> {
         let cache = self.cache.lock().await;
         let entry = cache.get(key)?;
         let left = entry.expires.checked_duration_since(Instant::now())?;
@@ -212,10 +220,23 @@ impl Proxy {
     }
 
     async fn store_cache(&self, key: &Key, response: &[u8]) {
+        if response.len() > MAX_CACHE_ENTRY_BYTES {
+            return;
+        }
         let Ok(message) = Message::from_vec(response) else {
             return;
         };
-        let ttl = message.answers.iter().map(|r| r.ttl).min().unwrap_or(0);
+        // Umur cache harus mengikuti TTL paling pendek di seluruh pesan:
+        // authority (mis. SOA negatif) dan additional juga bisa kedaluwarsa
+        // lebih dulu daripada answer.
+        let ttl = message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+            .map(|r| r.ttl)
+            .min()
+            .unwrap_or(0);
         if ttl == 0 || message.metadata.response_code != ResponseCode::NoError {
             return;
         }
@@ -227,7 +248,7 @@ impl Proxy {
         cache.insert(
             key.clone(),
             Entry {
-                bytes: response.to_vec(),
+                bytes: Arc::from(response),
                 expires: Instant::now() + lifetime,
             },
         );
@@ -262,34 +283,49 @@ impl Proxy {
 /// Buang entri kedaluwarsa, lalu entri yang paling cepat kedaluwarsa, sampai
 /// ada ruang. Versi lama mengosongkan seluruh cache saat penuh, yang membuat
 /// semua query berikutnya harus keluar jaringan sekaligus.
+///
+/// Pemilihan korban hanya satu kali `min_by_key`: versi sebelumnya memanggilnya
+/// berulang di dalam loop sehingga jadi O(n²) di jalur panas.
 fn make_room(cache: &mut HashMap<Key, Entry>) {
     let now = Instant::now();
     cache.retain(|_, entry| entry.expires > now);
-    while cache.len() >= MAX_CACHE_ITEMS {
-        let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.expires)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache.remove(&oldest);
+    if cache.len() < MAX_CACHE_ITEMS {
+        return;
+    }
+    // Satu korban cukup per insert. `min_by_key` O(n) tanpa meng-clone seluruh
+    // key, berbeda dengan sort O(n log n) yang sebelumnya berjalan di bawah
+    // lock cache pada setiap insert saat penuh.
+    if let Some(key) = cache
+        .iter()
+        .min_by_key(|(_, entry)| entry.expires)
+        .map(|(key, _)| key.clone())
+    {
+        cache.remove(&key);
     }
 }
 
 /// Siapkan jawaban cache untuk klien tertentu: ID query klien dipasang kembali
 /// dan TTL semua record diturunkan ke sisa umur cache (RFC 2181 §5.3), supaya
 /// klien tidak menyimpan rekaman lebih lama daripada yang kita anggap segar.
-fn cached_response(bytes: &[u8], id: [u8; 2], remaining: u32) -> Vec<u8> {
+fn cached_response(
+    bytes: &[u8],
+    id: [u8; 2],
+    remaining: u32,
+    question: &hickory_proto::op::Query,
+) -> Vec<u8> {
     let mut out = match Message::from_vec(bytes) {
         Ok(mut message) => {
-            for record in &mut message.answers {
-                record.ttl = record.ttl.min(remaining);
-            }
-            for record in &mut message.authorities {
-                record.ttl = record.ttl.min(remaining);
-            }
-            for record in &mut message.additionals {
+            // Cache key menormalkan huruf besar/kecil. Kembalikan pertanyaan
+            // persis seperti yang dikirim klien (termasuk 0x20 case
+            // randomization) supaya klien tidak menolak jawaban.
+            message.queries.clear();
+            message.queries.push(question.clone());
+            for record in message
+                .answers
+                .iter_mut()
+                .chain(message.authorities.iter_mut())
+                .chain(message.additionals.iter_mut())
+            {
                 record.ttl = record.ttl.min(remaining);
             }
             message.to_vec().unwrap_or_else(|_| bytes.to_vec())
@@ -350,12 +386,17 @@ pub async fn probe() -> Result<String, String> {
         .map_err(|e| format!("tidak bisa mengirim probe: {e}"))?;
 
     let mut buf = [0u8; 4096];
-    let (n, _) =
+    let (n, from) =
         match tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(format!("probe gagal: {e}")),
             Err(_) => return Err("proxy lokal tidak menjawab dalam 3 detik".to_string()),
         };
+    if from.to_string() != ADDR_V4 {
+        return Err(format!(
+            "jawaban probe datang dari {from}, bukan proxy lokal"
+        ));
+    }
     let response = &buf[..n];
     if response.len() < 12 || response[0..2] != expect {
         return Err("jawaban proxy tidak cocok dengan query".to_string());
@@ -493,14 +534,18 @@ async fn tcp_loop(listener: Arc<TcpListener>, proxy: Arc<Proxy>, mut stop: watch
 async fn serve_tcp(mut stream: TcpStream, proxy: Arc<Proxy>) {
     loop {
         let mut len_buf = [0u8; 2];
-        match tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf)).await {
-            Ok(Ok(_)) => {}
-            _ => return,
+        if tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf))
+            .await
+            .is_err()
+        {
+            return;
         }
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 {
             return;
         }
+        // Alokasi satu buffer per query; hindari `Vec` perantara `framed` saat
+        // mengirim jawaban.
         let mut request = vec![0u8; len];
         if tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut request))
             .await
@@ -511,13 +556,16 @@ async fn serve_tcp(mut stream: TcpStream, proxy: Arc<Proxy>) {
         let Some(response) = proxy.handle(&request, true).await else {
             return;
         };
+        // Tulis header langsung ke stream, lalu paketnya: tidak ada salinan
+        // perantara `framed` untuk request besar.
         if response.len() > u16::MAX as usize {
             return;
         }
-        let mut framed = Vec::with_capacity(response.len() + 2);
-        framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
-        framed.extend_from_slice(&response);
-        if stream.write_all(&framed).await.is_err() {
+        let header = (response.len() as u16).to_be_bytes();
+        if stream.write_all(&header).await.is_err() {
+            return;
+        }
+        if stream.write_all(&response).await.is_err() {
             return;
         }
     }
@@ -589,13 +637,26 @@ mod tests {
     #[test]
     fn cache_hit_menurunkan_ttl_dan_mengganti_id() {
         let response = big_response();
-        let served = cached_response(&response, [0xAB, 0xCD], 7);
+        let question = Message::from_vec(&response).unwrap().queries[0].clone();
+        let served = cached_response(&response, [0xAB, 0xCD], 7, &question);
         let message = Message::from_vec(&served).unwrap();
         assert_eq!(message.metadata.id, 0xABCD);
         assert!(
             message.answers.iter().all(|record| record.ttl <= 7),
             "TTL yang dikirim ke klien tidak boleh melebihi sisa umur cache"
         );
+    }
+
+    #[test]
+    fn cache_hit_mempertahankan_case_pertanyaan_klien() {
+        use hickory_proto::rr::Name;
+
+        let response = big_response();
+        let mut query = Message::from_vec(&response).unwrap().queries[0].clone();
+        query.set_name(Name::from_ascii("ExAmPlE.CoM.").unwrap());
+        let served = cached_response(&response, [0xAB, 0xCD], 7, &query);
+        let message = Message::from_vec(&served).unwrap();
+        assert_eq!(message.queries[0].name().to_ascii(), "ExAmPlE.CoM.");
     }
 
     #[test]
@@ -676,7 +737,7 @@ mod tests {
             cache.insert(
                 key(format!("n{i}")),
                 Entry {
-                    bytes: vec![0],
+                    bytes: Arc::from(vec![0]),
                     expires: now + Duration::from_secs(60 + i as u64),
                 },
             );

@@ -45,6 +45,11 @@ const TUNNEL_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 const TUNNEL_MTU: usize = 1280;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Batas respons API registrasi. Jawaban normal hanya beberapa KB; tanpa batas
+/// server (atau MITM) bisa membuat proses kehabisan memori.
+const MAX_API_BYTES: usize = 256 * 1024;
+/// Penanda nilai yang dienkripsi DPAPI di `warp.json`.
+const SECRET_PREFIX: &str = "dpapi:";
 
 // ── berkas konfigurasi ──────────────────────────────────────────────────
 
@@ -101,6 +106,14 @@ pub fn load() -> Result<Config, String> {
         // ulang kalau nilainya ditulis kembali.
         config.protected = false;
     }
+    if config.token.starts_with(SECRET_PREFIX) {
+        let encoded = config.token[SECRET_PREFIX.len()..].to_string();
+        config.token = unprotect_secret(&encoded)?;
+    } else if !config.token.is_empty() {
+        // Berkas lama menyimpan token polos. Tulis ulang sekali supaya token
+        // ikut terenkripsi. Kegagalan menulis tidak boleh memblokir `load`.
+        let _ = save(&config);
+    }
     Ok(config)
 }
 
@@ -146,6 +159,11 @@ pub fn save(config: &Config) -> Result<(), String> {
     if !stored.protected {
         stored.private_key = protect_secret(&stored.private_key)?;
         stored.protected = true;
+    }
+    // Token juga rahasia (bearer untuk API akun); berkas lama menyimpannya
+    // polos, jadi penanda prefix dipakai alih-alih field baru.
+    if !stored.token.is_empty() && !stored.token.starts_with(SECRET_PREFIX) {
+        stored.token = format!("{SECRET_PREFIX}{}", protect_secret(&stored.token)?);
     }
     let raw = serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?;
     std::fs::write(&path, raw).map_err(|e| format!("gagal menulis {}: {e}", path.display()))
@@ -473,13 +491,23 @@ async fn https_json(
     auth: Option<&str>,
     body: &str,
 ) -> Result<String, String> {
-    let addrs = tokio::net::lookup_host((API_HOST, 443))
+    let addrs: Vec<_> = tokio::net::lookup_host((API_HOST, 443))
         .await
-        .map_err(|e| format!("tidak bisa me-resolve {API_HOST}: {e}"))?;
-    let addr = addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("{API_HOST} tidak punya alamat"))?;
+        .map_err(|e| format!("tidak bisa me-resolve {API_HOST}: {e}"))?
+        .collect();
+    let mut tcp = None;
+    let mut last = format!("{API_HOST} tidak punya alamat");
+    for addr in addrs {
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                tcp = Some(stream);
+                break;
+            }
+            Ok(Err(e)) => last = format!("koneksi ke {addr} gagal: {e}"),
+            Err(_) => last = format!("timeout koneksi ke {addr}"),
+        }
+    }
+    let tcp = tcp.ok_or(last)?;
 
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -487,11 +515,6 @@ async fn https_json(
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| format!("timeout koneksi ke {API_HOST}"))?
-        .map_err(|e| format!("koneksi ke {API_HOST} gagal: {e}"))?;
 
     let name = ServerName::try_from(API_HOST.to_string())
         .map_err(|_| "nama server API tidak valid".to_string())?;
@@ -525,10 +548,20 @@ async fn https_json(
     stream.flush().await.ok();
 
     let mut raw = Vec::new();
-    tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut raw))
-        .await
-        .map_err(|_| "timeout menunggu respons API".to_string())?
-        .map_err(|e| format!("gagal membaca respons API: {e}"))?;
+    // Baca paling banyak satu byte lebih dari batas supaya respons kepanjangan
+    // terdeteksi, bukan diam-diam terpotong.
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        (&mut stream)
+            .take(MAX_API_BYTES as u64 + 1)
+            .read_to_end(&mut raw),
+    )
+    .await
+    .map_err(|_| "timeout menunggu respons API".to_string())?
+    .map_err(|e| format!("gagal membaca respons API: {e}"))?;
+    if raw.len() > MAX_API_BYTES {
+        return Err("respons API melebihi batas".to_string());
+    }
 
     let split = raw
         .windows(4)
@@ -554,6 +587,14 @@ async fn https_json(
     let text = String::from_utf8_lossy(&tail).to_string();
     if !(200..300).contains(&status) {
         return Err(format!("API Cloudflare menolak (HTTP {status}): {text}"));
+    }
+    // Jawaban sukses harus JSON. Tanpa pemeriksaan ini, halaman captive portal
+    // atau proxy TLS bisa lolos dan gagal jauh kemudian saat field dibaca.
+    if !head
+        .to_ascii_lowercase()
+        .contains("content-type: application/json")
+    {
+        return Err(format!("respons API bukan JSON (HTTP {status})"));
     }
     Ok(text)
 }
@@ -847,7 +888,7 @@ fn cert_spki(cert: &[u8]) -> Option<Vec<u8>> {
 fn utc_time(secs: u64) -> Result<String, String> {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
+    let (year, month, day) = crate::log::civil_from_days(days);
     if !(1950..=2049).contains(&year) {
         return Err("tahun sertifikat di luar jangkauan UTCTime".to_string());
     }
@@ -862,19 +903,6 @@ fn utc_time(secs: u64) -> Result<String, String> {
     ))
 }
 
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    (y + if m <= 2 { 1 } else { 0 }, m as u32, d as u32)
-}
-
 fn timestamp_iso8601() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -882,7 +910,7 @@ fn timestamp_iso8601() -> String {
         .unwrap_or(0);
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
+    let (year, month, day) = crate::log::civil_from_days(days);
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000+00:00",
         rem / 3600,
@@ -908,7 +936,7 @@ pub struct Tunnel {
     next_port: AtomicU16,
     /// Penerima paket IP mentah, dipakai mode VPN penuh. Tanpa penerima,
     /// paket selain jawaban DNS dibuang seperti sebelumnya.
-    raw: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    raw: Arc<std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl Tunnel {
@@ -1073,7 +1101,7 @@ impl Tunnel {
     }
 
     /// Paket IP mentah yang datang dari WARP dikirim ke sini (mode VPN penuh).
-    pub fn set_raw_sink(&self, sink: mpsc::UnboundedSender<Vec<u8>>) {
+    pub fn set_raw_sink(&self, sink: mpsc::Sender<Vec<u8>>) {
         if let Ok(mut slot) = self.raw.lock() {
             *slot = Some(sink);
         }
@@ -1293,29 +1321,28 @@ fn qpack_status(payload: &[u8]) -> Option<u16> {
             // Indexed field line.
             let statis = first & 0x40 != 0;
             let index = qpack_int(payload, &mut pos, 6)?;
-            if statis {
-                if let Some(code) = static_status(index) {
-                    return Some(code);
-                }
+            if statis && let Some(code) = static_status(index) {
+                return Some(code);
             }
         } else if first & 0xC0 == 0x40 {
             // Literal dengan referensi nama.
             let statis = first & 0x10 != 0;
             let index = qpack_int(payload, &mut pos, 4)?;
             let value = qpack_string(payload, &mut pos)?;
-            if statis && index == 24 {
-                if let Some(text) = value {
-                    return text.trim().parse::<u16>().ok();
-                }
+            if statis
+                && index == 24
+                && let Some(text) = value
+            {
+                return text.trim().parse::<u16>().ok();
             }
         } else if first & 0xE0 == 0x20 {
             // Literal dengan nama literal.
             let name = qpack_string(payload, &mut pos)?;
             let value = qpack_string(payload, &mut pos)?;
-            if name.as_deref() == Some(":status") {
-                if let Some(text) = value {
-                    return text.trim().parse::<u16>().ok();
-                }
+            if name.as_deref() == Some(":status")
+                && let Some(text) = value
+            {
+                return text.trim().parse::<u16>().ok();
             }
         } else {
             // Post-base / bentuk lain: menyerah, biarkan query yang menentukan.
@@ -1344,7 +1371,7 @@ fn static_status(index: u64) -> Option<u16> {
 fn spawn_reader(
     conn: quinn::Connection,
     pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
-    raw: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    raw: Arc<std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1364,13 +1391,17 @@ fn spawn_reader(
                 let _ = tx.send(dns.to_vec());
                 continue;
             }
-            // Hanya paket IPv4 yang bisa ditulis ke adapter TUN kita.
+            // Paket IPv4 dan IPv6 ditulis ke adapter TUN. Rute v6 hanya ada
+            // kalau WARP memberi alamat v6, jadi paket v6 tanpa rute tidak akan
+            // sampai ke sini.
             if packet.len() >= 20
-                && packet[0] >> 4 == 4
+                && (packet[0] >> 4 == 4 || (packet[0] >> 4 == 6 && packet.len() >= 40))
                 && let Ok(slot) = raw.lock()
                 && let Some(sink) = slot.as_ref()
             {
-                let _ = sink.send(packet.to_vec());
+                // Channel terbatas: paket dibuang saat konsumen Wintun tertinggal.
+                // UDP memang boleh loss; TCP di ujung sana akan retransmisi.
+                let _ = sink.try_send(packet.to_vec());
             }
         }
     });

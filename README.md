@@ -68,7 +68,7 @@ UAC sendiri. Tombol:
 | `↑` `↓` / `j` `k` | pindah pilihan |
 | `1` – `9` | lompat ke baris |
 | `Enter` | terapkan resolver yang dipilih (DNS saja) |
-| `v` | nyalakan/matikan VPN — seluruh trafik lewat WARP |
+| `v` | nyalakan/matikan VPN — seluruh trafik (IPv4 + IPv6) lewat WARP |
 | `c` | Clear DNS (pulihkan, tetap di TUI) |
 | `l` | log query terakhir (jalur + latensi) |
 | `?` | bantuan |
@@ -366,7 +366,7 @@ atau tidak**. Di TUI, tombol `v` menjawabnya.
   lalu keluar lewat DoQ/DoH3/WARP-DNS; trafik lain tetap lewat jalur biasa.
 - **Ya** (`v`) — VPN + DNS. MyDNS membuat adapter TUN, memasang dua rute `/1`
   (lebih spesifik dari default route, jadi bisa dicabut bersih), dan membawa
-  **seluruh trafik IPv4** lewat tunnel WARP MASQUE yang sama dengan jalur DNS.
+  **seluruh trafik (IPv4 dan IPv6)** lewat tunnel WARP MASQUE yang sama dengan jalur DNS.
 
 VPN bukan pengganti pilihan resolver: resolver yang sedang dipilih tetap dipakai.
 `Quad9 + VPN` berarti query DNS tetap ke Quad9 (lewat DoQ di dalam tunnel),
@@ -449,11 +449,11 @@ saat logon tetap bisa mencabutnya setelah crash atau reboot.
 - **Query identik yang datang bersamaan diteruskan sekali.** Sisanya menunggu
   lalu mengambil hasil dari cache, jadi lonjakan query yang sama tidak
   menggandakan trafik ke resolver.
-- **VPN penuh hanya untuk IPv4.** Rute `::/1` dan `8000::/1` belum dipasang, jadi
-  trafik IPv6 tetap keluar lewat jalur asli saat VPN menyala. Ini batasan yang
-  disengaja untuk sekarang: rute IPv6 ke adapter Wintun butuh alamat link-local
-  dan next-hop yang berbeda, dan kesalahan di sana memutus konektivitas lebih
-  luas. DNS AAAA tetap dijawab lewat tunnel.
+- **VPN penuh mencakup IPv4 dan IPv6.** Alamat v6 dari WARP dipasang di adapter
+  dengan prefix `/128`, lalu rute `::/1` dan `8000::/1` diarahkan ke tunnel.
+  Endpoint QUIC tetap dikecualikan lewat host route v4 atau v6, mengikuti alamat
+  yang benar-benar dipakai. Kalau WARP tidak memberi alamat v6, VPN tetap jalan
+  dengan IPv4 saja — DNS IPv6 (`::1`) sudah aktif selama listener v6 tersedia.
 - **VPN butuh `wintun.dll` dan hak admin.** Membuat adapter TUN tidak bisa
   dilakukan tanpa elevasi, dan DLL-nya harus ikut didistribusikan bersama
   `mydns.exe` (lihat bagian mode VPN).
@@ -470,7 +470,7 @@ saat logon tetap bisa mencabutnya setelah crash atau reboot.
 | `src/main.rs` | CLI, elevasi UAC, subperintah |
 | `src/providers.rs` | katalog resolver, `resolvers.txt`, endpoint DoQ/DoH, IP bootstrap |
 | `src/engine.rs` | klien DoQ (quinn), DoH3 (h3), DoH2 (h2), rantai fallback |
-| `src/warp.rs` | registrasi WARP, mTLS + pinning SPKI, tunnel CONNECT-IP, paket IPv4/UDP |
+| `src/warp.rs` | registrasi WARP, mTLS + pinning SPKI, tunnel CONNECT-IP, paket IP (IPv4 + IPv6) |
 | `src/server.rs` | listener UDP/TCP di loopback, cache TTL, truncation |
 | `src/daemon.rs` | mode tanpa TUI, named pipe `\\.\pipe\mydns-daemon`, status/restore/stop |
 | `src/ui.rs` | TUI ratatui + alur terapkan/pulihkan |
