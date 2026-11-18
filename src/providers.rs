@@ -239,10 +239,18 @@ fn parse_line(line: &str) -> Result<Entry, String> {
         value => {
             let (host, port) = match value.rsplit_once(':') {
                 Some((host, port)) => {
+                    let host = host.trim();
+                    // `::1` dipecah jadi host ":" dan port "1". IPv6 tanpa
+                    // tanda kurung tidak bisa dibedakan dari host:port.
+                    if host.contains(':') && !host.starts_with('[') {
+                        return Err(format!(
+                            "host IPv6 DoQ harus dalam tanda kurung dengan port: [host]:853 ({value})"
+                        ));
+                    }
                     let port = port
                         .parse::<u16>()
                         .map_err(|_| format!("port DoQ tidak valid: {port}"))?;
-                    (host.trim(), port)
+                    (host, port)
                 }
                 None => (value, 853),
             };
@@ -429,6 +437,13 @@ mod tests {
         let config = parse("k | N | c | [::1]:853 | - | 1.2.3.4");
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         assert_eq!(config.entries[0].doq, Some(("::1".to_string(), 853)));
+
+        let config = parse("k | N | c | ::1 | - | 1.2.3.4");
+        assert!(
+            config.errors.iter().any(|e| e.contains("tanda kurung")),
+            "{:?}",
+            config.errors
+        );
     }
 
     #[test]

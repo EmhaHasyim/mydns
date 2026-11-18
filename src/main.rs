@@ -159,7 +159,7 @@ fn cmd_restore(args: &[String]) {
     let stale_only = args.iter().any(|a| a == "--if-stale");
     need_admin(args);
     let rt = runtime();
-    let result = rt.block_on(async {
+    let (warning, result) = rt.block_on(async {
         // Rute VPN dicabut dulu: internet kembali lewat jalur asli sebelum
         // DNS dipulihkan, jadi tidak ada jendela tanpa koneksi.
         let vpn_error = if stale_only {
@@ -189,18 +189,17 @@ fn cmd_restore(args: &[String]) {
                 .await
                 .map(|r| r.map(Some))
         };
-        restored.map(|r| {
-            r.map(|message| {
-                message.map(|m| match &warning {
-                    Some(w) => format!("{m}\n{w}"),
-                    None => m,
-                })
-            })
-        })
+        (warning, restored)
     });
     match result {
-        Ok(Ok(Some(message))) => println!("{message}"),
-        Ok(Ok(None)) => println!("tidak ada yang perlu dipulihkan"),
+        Ok(Ok(Some(message))) => match &warning {
+            Some(w) => println!("{message}\n{w}"),
+            None => println!("{message}"),
+        },
+        Ok(Ok(None)) => match &warning {
+            Some(w) => println!("tidak ada yang perlu dipulihkan\n{w}"),
+            None => println!("tidak ada yang perlu dipulihkan"),
+        },
         Ok(Err(e)) => {
             eprintln!("gagal: {e}");
             std::process::exit(1);
@@ -215,9 +214,10 @@ fn cmd_restore(args: &[String]) {
 /// Dipanggil anak pendamping: tunggu induk selesai, lalu bersihkan kalau induk
 /// tidak sempat melakukannya sendiri.
 fn cmd_watchdog(pid: u32) {
-    if !win::wait_for_process(pid) {
-        return;
-    }
+    // `wait_for_process` menunggu sampai induk benar-benar pergi. Kalau induk
+    // sudah hilang saat dibuka, ia mengembalikan false — tapi pemulihan tetap
+    // wajib dijalankan (restore_if_stale aman dan idempoten).
+    let _ = win::wait_for_process(pid);
     // Urutan sama dengan pemulihan manual: rute VPN dulu, baru DNS.
     let _ = vpn::down_if_stale();
     let _ = win::restore_if_stale();

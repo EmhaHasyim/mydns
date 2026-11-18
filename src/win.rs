@@ -555,6 +555,25 @@ fn now_secs() -> u64 {
 /// `listen_v6` menandakan proxy benar-benar punya listener di `[::1]:53`.
 /// Kalau tidak, `::1` tidak dipasang: DNS IPv6 yang menunjuk port mati akan
 /// memutus resolusi IPv6 tanpa alasan.
+/// Susun skrip PowerShell pengalih DNS. Satu adapter cukup satu panggilan
+/// `Set-DnsClientServerAddress`, karena cmdlet itu mengganti seluruh daftar.
+fn apply_script(adapters: &[Adapter], listen_v6: bool) -> String {
+    let mut script = String::from("$ok=@(); $bad=@()\n");
+    let servers = if listen_v6 {
+        "'127.0.0.1','::1'"
+    } else {
+        "'127.0.0.1'"
+    };
+    for a in adapters {
+        script.push_str(&format!(
+            "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses {servers} -ErrorAction Stop; $ok += '{}' }} catch {{ $bad += \"{}: $($_.Exception.Message)\" }}\n",
+            a.index, a.index, a.index
+        ));
+    }
+    script.push_str("@{ok=$ok; bad=$bad} | ConvertTo-Json -Compress\n");
+    script
+}
+
 pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String> {
     require_admin()?;
     let adapters = list_adapters()?;
@@ -577,21 +596,7 @@ pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String>
     }
     save_state(&saved)?;
 
-    let mut script = String::from("$ok=@(); $bad=@()\n");
-    for a in &adapters {
-        script.push_str(&format!(
-            "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '127.0.0.1' -ErrorAction Stop; $ok += '{}' }} catch {{ $bad += \"{}: $($_.Exception.Message)\" }}\n",
-            a.index, a.index, a.index
-        ));
-        if listen_v6 {
-            script.push_str(&format!(
-                "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses '::1' -ErrorAction Stop }} catch {{ $bad += \"{} v6: $($_.Exception.Message)\" }}\n",
-                a.index, a.index
-            ));
-        }
-    }
-    script.push_str("@{ok=$ok; bad=$bad} | ConvertTo-Json -Compress\n");
-
+    let script = apply_script(&adapters, listen_v6);
     let raw = run_ps(&script)?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
     let ok_count = json_count(parsed.get("ok"));
@@ -642,25 +647,31 @@ fn restore_plan(saved: Option<&Saved>, adapters: &[Adapter]) -> (String, usize) 
 
                 let has_v4 = !iface.v4.is_empty();
                 let has_v6 = !iface.v6.is_empty();
-                // Reset ke DHCP hanya perlu kalau aslinya memang DHCP, atau kalau
-                // salah satu family kosong (supaya sisa 127.0.0.1 / ::1 hilang).
-                // Kalau dua-duanya statis, cukup ditimpa — lebih tepat ke aslinya.
-                if (!has_v4 && !has_v6) || (has_v4 != has_v6) {
+                if has_v4 && has_v6 {
+                    // Cmdlet mengganti seluruh daftar: kirim v4 + v6 sekaligus.
+                    let mut all = iface.v4.clone();
+                    all.extend(iface.v6.iter().cloned());
+                    script.push_str(&format!(
+                        "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses {} -ErrorAction SilentlyContinue\n",
+                        quote_list(&all)
+                    ));
+                } else {
+                    // Salah satu family kosong: reset dulu supaya sisa
+                    // 127.0.0.1 / ::1 ikut hilang sebelum family lain ditulis.
                     script.push_str(&format!(
                         "Set-DnsClientServerAddress -InterfaceIndex {index} -ResetServerAddresses -ErrorAction SilentlyContinue\n"
                     ));
-                }
-                if has_v4 {
-                    script.push_str(&format!(
-                        "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses {} -ErrorAction SilentlyContinue\n",
-                        quote_list(&iface.v4)
-                    ));
-                }
-                if has_v6 {
-                    script.push_str(&format!(
-                        "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses {} -ErrorAction SilentlyContinue\n",
-                        quote_list(&iface.v6)
-                    ));
+                    if has_v4 {
+                        script.push_str(&format!(
+                            "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses {} -ErrorAction SilentlyContinue\n",
+                            quote_list(&iface.v4)
+                        ));
+                    } else if has_v6 {
+                        script.push_str(&format!(
+                            "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses {} -ErrorAction SilentlyContinue\n",
+                            quote_list(&iface.v6)
+                        ));
+                    }
                 }
                 touched += 1;
             }
@@ -721,17 +732,30 @@ pub fn restore() -> Result<String, String> {
 }
 
 fn verify_restored() -> Result<(), String> {
-    let adapters = list_adapters()?;
-    if let Some(stuck) = adapters
-        .iter()
-        .find(|a| a.v4.iter().any(|s| s == "127.0.0.1") || a.v6.iter().any(|s| s == "::1"))
-    {
-        return Err(format!(
-            "DNS adapter {} masih menunjuk loopback setelah restore",
-            stuck.index
-        ));
+    // Sama seperti verify_applied: tulisan PowerShell butuh waktu sebelum
+    // terbaca lewat GetAdaptersAddresses. Coba beberapa kali sebelum gagal.
+    let mut last = String::new();
+    for attempt in 0..3 {
+        match list_adapters() {
+            Ok(adapters) => {
+                if let Some(stuck) = adapters.iter().find(|a| {
+                    a.v4.iter().any(|s| s == "127.0.0.1") || a.v6.iter().any(|s| s == "::1")
+                }) {
+                    last = format!(
+                        "DNS adapter {} masih menunjuk loopback setelah restore",
+                        stuck.index
+                    );
+                } else {
+                    return Ok(());
+                }
+            }
+            Err(e) => last = e,
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
-    Ok(())
+    Err(format!("verifikasi restore gagal: {last}"))
 }
 
 /// True kalau ada adapter aktif yang DNS-nya tidak lagi menunjuk proxy lokal.
@@ -1017,6 +1041,9 @@ pub fn wait_for_process(pid: u32) -> bool {
 /// pernah memunculkan jendela dan tidak pernah mengubah apa pun selama induk
 /// masih hidup.
 pub fn spawn_watchdog() {
+    // shortcut: pendamping menunggu PID mentah; kalau PID dipakai ulang sebelum
+    // OpenProcess, ia bisa menunggu proses yang salah. Upgrade: teruskan handle
+    // induk yang sudah diduplikasi (atau waktu mulai proses) lewat argumen.
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -1303,6 +1330,53 @@ pub fn relaunch_elevated(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_menulis_v4_dan_v6_dalam_satu_perintah() {
+        let adapters = [Adapter {
+            index: 18,
+            name: "Ethernet".to_string(),
+            v4: vec!["94.140.14.14".to_string()],
+            v6: Vec::new(),
+        }];
+        let script = apply_script(&adapters, true);
+        let set_lines: Vec<&str> = script
+            .lines()
+            .filter(|line| line.contains("Set-DnsClientServerAddress"))
+            .collect();
+        assert_eq!(set_lines.len(), 1, "satu adapter = satu perintah: {script}");
+        assert!(set_lines[0].contains("'127.0.0.1'"), "{script}");
+        assert!(set_lines[0].contains("'::1'"), "{script}");
+    }
+
+    #[test]
+    fn restore_menulis_v4_dan_v6_dalam_satu_perintah() {
+        let adapters = [Adapter {
+            index: 18,
+            name: "Ethernet".to_string(),
+            v4: vec!["127.0.0.1".to_string()],
+            v6: vec!["::1".to_string()],
+        }];
+        let mut saved = Saved::default();
+        saved.ifaces.insert(
+            "18".to_string(),
+            SavedIface {
+                name: "Ethernet".to_string(),
+                v4: vec!["94.140.14.14".to_string()],
+                v6: vec!["2620:fe::fe".to_string()],
+            },
+        );
+        let (script, _) = restore_plan(Some(&saved), &adapters);
+        let set_lines: Vec<&str> = script
+            .lines()
+            .filter(|line| {
+                line.contains("Set-DnsClientServerAddress") && line.contains("-ServerAddresses")
+            })
+            .collect();
+        assert_eq!(set_lines.len(), 1, "satu adapter = satu perintah: {script}");
+        assert!(set_lines[0].contains("94.140.14.14"), "{script}");
+        assert!(set_lines[0].contains("2620:fe::fe"), "{script}");
+    }
 
     #[test]
     fn acl_direktori_state_bisa_dipasang() {

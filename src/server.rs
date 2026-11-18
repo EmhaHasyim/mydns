@@ -241,6 +241,11 @@ impl Proxy {
         let Ok(message) = Message::from_vec(response) else {
             return;
         };
+        // Jawaban terpotong (TC=1) tidak boleh di-cache: klien akan mengulang
+        // lewat TCP dan mendapat jawaban tanpa record yang sama terus-menerus.
+        if message.metadata.truncation {
+            return;
+        }
         // Umur cache harus mengikuti TTL paling pendek di seluruh pesan:
         // authority (mis. SOA negatif) dan additional juga bisa kedaluwarsa
         // lebih dulu daripada answer.
@@ -540,13 +545,13 @@ async fn tcp_loop(listener: Arc<TcpListener>, proxy: Arc<Proxy>, mut stop: watch
             accepted = listener.accept() => {
                 let Ok((stream, _peer)) = accepted else { continue };
                 let proxy = proxy.clone();
-                // Tunggu slot sebelum spawn; permit dilepas saat task selesai.
-                // shortcut: saat 64 slot penuh accept ikut menunggu (maks ~10s, timeout
-                // serve_tcp); ganti try_acquire + tutup koneksi kalau perlu non-blokir.
-                let permit = Arc::clone(&proxy.tcp_permits)
-                    .acquire_owned()
-                    .await
-                    .expect("semaphore tidak pernah ditutup");
+                // Jangan menunggu slot di sini: `acquire_owned().await` membuat
+                // `stop.changed()` tidak dipoll lagi dan shutdown bisa macet.
+                // Kalau 64 slot penuh, tutup koneksi ini dan tetap dengarkan stop.
+                let Ok(permit) = Arc::clone(&proxy.tcp_permits).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 tokio::spawn(async move {
                     let _permit = permit;
                     serve_tcp(stream, proxy).await
@@ -698,6 +703,45 @@ mod tests {
     }
 
     #[test]
+    fn query_dengan_opsi_edns_tidak_cacheable() {
+        use hickory_proto::op::{Edns, MessageType, Query};
+        use hickory_proto::rr::Name;
+        use hickory_proto::rr::rdata::opt::EdnsOption;
+
+        let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4]));
+        message.set_edns(edns);
+        assert!(!is_cacheable(&message, message.queries.first().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn respons_terpotong_tidak_disimpan_di_cache() {
+        let mut response = big_response();
+        response[2] |= 0x02; // bit TC
+        let message = Message::from_vec(&response).unwrap();
+        assert!(message.metadata.truncation, "fixture harus terpotong");
+
+        let provider = &crate::providers::providers()[0];
+        let proxy = Proxy::new(
+            crate::engine::Engine::new(provider).unwrap(),
+            Arc::new(crate::log::Log::new()),
+        );
+        let key = cache_key(message.queries.first().unwrap(), &message);
+        proxy.store_cache(&key, &response).await;
+        assert!(
+            proxy.cache.lock().await.is_empty(),
+            "respons dengan TC=1 tidak boleh masuk cache"
+        );
+    }
+
+    #[test]
     fn fit_udp_memotong_paket_besar_dengan_bit_tc() {
         let response = big_response();
         assert!(
@@ -733,6 +777,7 @@ mod tests {
             "ID harus sama supaya klien menerimanya"
         );
         assert_eq!(out[2] & 0x80, 0x80, "QR harus 1");
+        assert_eq!(out[2] & 0x78, query[2] & 0x78, "Opcode harus dipertahankan");
         assert_eq!(out[3] & 0x0F, 0x02, "RCODE harus SERVFAIL");
         assert_eq!(
             &out[6..12],

@@ -994,6 +994,15 @@ pub struct Tunnel {
     raw: Arc<std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
 }
 
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        // `conn` dipegang juga oleh reader dan driver h3; tanpa close() keduanya
+        // tidak pernah berhenti dan keep-alive terus mengirim paket.
+        self.conn
+            .close(quinn::VarInt::from_u32(0), b"tunnel ditutup");
+    }
+}
+
 impl Tunnel {
     pub async fn connect(config: &Config) -> Result<Arc<Self>, String> {
         let src = config.tunnel_ipv4()?;
@@ -1397,10 +1406,18 @@ fn qpack_status(payload: &[u8]) -> Option<u16> {
                 return text.trim().parse::<u16>().ok();
             }
         } else if first & 0xE0 == 0x20 {
-            // Literal dengan nama literal.
-            let name = qpack_string(payload, &mut pos)?;
+            // Literal dengan nama literal (RFC 9204 §4.5.6): panjang nama
+            // memakai prefiks 3 bit di byte opcode, bukan qpack_string 8 bit.
+            let name_huffman = first & 0x10 != 0;
+            let name_len = qpack_int(payload, &mut pos, 3)? as usize;
+            let name_end = pos.checked_add(name_len)?;
+            if name_huffman || payload.len() < name_end {
+                return None;
+            }
+            let name = std::str::from_utf8(&payload[pos..name_end]).ok()?;
+            pos = name_end;
             let value = qpack_string(payload, &mut pos)?;
-            if name.as_deref() == Some(":status")
+            if name == ":status"
                 && let Some(text) = value
             {
                 return text.trim().parse::<u16>().ok();
@@ -1415,14 +1432,13 @@ fn qpack_status(payload: &[u8]) -> Option<u16> {
 
 /// Indeks statis RFC 9204 untuk `:status`.
 fn static_status(index: u64) -> Option<u16> {
+    // RFC 9204 Appendix A (QPACK), bukan tabel HPACK.
     match index {
+        24 => Some(103),
         25 => Some(200),
-        26 => Some(204),
-        27 => Some(206),
-        28 => Some(304),
-        29 => Some(400),
-        30 => Some(404),
-        31 => Some(500),
+        26 => Some(304),
+        27 => Some(404),
+        28 => Some(503),
         _ => None,
     }
 }

@@ -608,6 +608,9 @@ impl Engine {
             let mut chunk = chunk.map_err(|e| format!("baca body: {e}"))?;
             let n = chunk.remaining();
             if out.len() + n > MAX_MESSAGE {
+                // Kapasitas sudah dikreditkan oleh `recv.data()`: kembalikan
+                // sebelum keluar supaya window koneksi tidak menyusut permanen.
+                let _ = recv.flow_control().release_capacity(n);
                 return Err("respons DoH melebihi batas".to_string());
             }
             out.extend_from_slice(&chunk.copy_to_bytes(n));

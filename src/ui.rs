@@ -953,6 +953,18 @@ async fn fail_restore(tx: UnboundedSender<Msg>, message: String) {
     let _ = tx.send(Msg::Failed(message));
 }
 
+/// Tunggu task pendukung maksimal 3 detik. `drift_task` bisa sedang berada di
+/// dalam PowerShell; tanpa batas ini tombol keluar bisa macet sebelum DNS
+/// sempat dipulihkan (dan watchdog tidak bisa menolong selama proses hidup).
+async fn finish_task<T>(label: &str, task: tokio::task::JoinHandle<T>) {
+    if tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .is_err()
+    {
+        crate::log::event(&format!("stop_session: {label} timeout setelah 3 detik"));
+    }
+}
+
 async fn stop_session(session: &Arc<Mutex<Option<Session>>>) {
     let taken = { session.lock().await.take() };
     if let Some(session) = taken {
@@ -965,10 +977,10 @@ async fn stop_session(session: &Arc<Mutex<Option<Session>>>) {
             vpn,
         } = session;
         let _ = stop.send(true);
-        let _ = proxy_task.await;
-        let _ = stats_task.await;
-        let _ = drift_task.await;
-        let _ = warm_task.await;
+        finish_task("proxy", proxy_task).await;
+        finish_task("stats", stats_task).await;
+        finish_task("drift", drift_task).await;
+        finish_task("warm", warm_task).await;
         // Proxy berhenti dulu, baru tunnel: pengguna tidak pernah kehilangan
         // resolver selama rute masih dialihkan.
         if let Some(vpn) = vpn {
@@ -1230,6 +1242,14 @@ async fn apply_flow(
         if let Some(vpn) = vpn.take() {
             let _ = vpn.down().await;
         }
+        // DNS sudah dipasang pada titik ini. Sesi belum disimpan, jadi `run`
+        // tidak akan memulihkannya — lakukan di sini, lalu tunggu task yang
+        // masih bisa memasang loopback lagi (drift) sebelum keluar.
+        let _ = tokio::task::spawn_blocking(win::restore).await;
+        finish_task("proxy", proxy_task).await;
+        finish_task("stats", stats_task).await;
+        finish_task("drift", drift_task).await;
+        finish_task("warm", warm_task).await;
         return;
     }
     *session.lock().await = Some(Session {
