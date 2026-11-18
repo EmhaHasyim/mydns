@@ -522,12 +522,20 @@ fn verify_applied(adapters: &[Adapter], listen_v6: bool) -> Result<(), String> {
         match list_adapters() {
             Ok(now) => {
                 if let Some(missing) = adapters.iter().find(|saved| {
+                    let need_v6 = listen_v6 && !saved.v6.is_empty();
                     now.iter().find(|a| a.index == saved.index).is_none_or(|a| {
                         !a.v4.iter().any(|server| server == "127.0.0.1")
-                            || (listen_v6 && !a.v6.iter().any(|server| server == "::1"))
+                            || (need_v6 && !a.v6.iter().any(|server| server == "::1"))
                     })
                 }) {
-                    last = format!("adapter {} belum memakai proxy loopback", missing.index);
+                    let need_v6 = listen_v6 && !missing.v6.is_empty();
+                    let actual = now.iter().find(|a| a.index == missing.index);
+                    last = format!(
+                        "adapter {} belum memakai proxy loopback (v4 {:?}, v6 {:?}, butuh_v6 {need_v6}, listen_v6 {listen_v6})",
+                        missing.index,
+                        actual.map(|a| &a.v4),
+                        actual.map(|a| &a.v6),
+                    );
                 } else {
                     return Ok(());
                 }
@@ -559,12 +567,15 @@ fn now_secs() -> u64 {
 /// `Set-DnsClientServerAddress`, karena cmdlet itu mengganti seluruh daftar.
 fn apply_script(adapters: &[Adapter], listen_v6: bool) -> String {
     let mut script = String::from("$ok=@(); $bad=@()\n");
-    let servers = if listen_v6 {
-        "'127.0.0.1','::1'"
-    } else {
-        "'127.0.0.1'"
-    };
     for a in adapters {
+        // `::1` hanya dipasang kalau adapter ini sebelumnya memang punya DNS
+        // IPv6. Adapter tanpa IPv6 (mis. Ethernet IPv4-only) menolak/mengabaikan
+        // `::1`, dan verifikasi tidak boleh menagihnya.
+        let servers = if listen_v6 && !a.v6.is_empty() {
+            "'127.0.0.1','::1'"
+        } else {
+            "'127.0.0.1'"
+        };
         script.push_str(&format!(
             "try {{ Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses {servers} -ErrorAction Stop; $ok += '{}' }} catch {{ $bad += \"{}: $($_.Exception.Message)\" }}\n",
             a.index, a.index, a.index
@@ -1337,7 +1348,7 @@ mod tests {
             index: 18,
             name: "Ethernet".to_string(),
             v4: vec!["94.140.14.14".to_string()],
-            v6: Vec::new(),
+            v6: vec!["2620:fe::fe".to_string()],
         }];
         let script = apply_script(&adapters, true);
         let set_lines: Vec<&str> = script
@@ -1347,6 +1358,19 @@ mod tests {
         assert_eq!(set_lines.len(), 1, "satu adapter = satu perintah: {script}");
         assert!(set_lines[0].contains("'127.0.0.1'"), "{script}");
         assert!(set_lines[0].contains("'::1'"), "{script}");
+    }
+
+    #[test]
+    fn adapter_tanpa_ipv6_tidak_ditagih_loopback_v6() {
+        let adapters = [Adapter {
+            index: 18,
+            name: "Ethernet".to_string(),
+            v4: vec!["94.140.14.14".to_string()],
+            v6: Vec::new(),
+        }];
+        let script = apply_script(&adapters, true);
+        assert!(script.contains("'127.0.0.1'"), "{script}");
+        assert!(!script.contains("'::1'"), "{script}");
     }
 
     #[test]
