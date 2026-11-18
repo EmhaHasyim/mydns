@@ -16,7 +16,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+
+    if args
+        .iter()
+        .any(|a| a == "-h" || a == "--help" || a == "help")
+    {
+        help();
+        return;
+    }
 
     // Pendamping pemulihan (lihat win::spawn_watchdog). Tidak pernah
     // mengubah apa pun selama induknya masih hidup.
@@ -24,14 +35,6 @@ fn main() {
         && let Some(pid) = args.get(pos + 1).and_then(|p| p.parse::<u32>().ok())
     {
         cmd_watchdog(pid);
-        return;
-    }
-
-    if args
-        .iter()
-        .any(|a| a == "-h" || a == "--help" || a == "help")
-    {
-        help();
         return;
     }
 
@@ -157,17 +160,43 @@ fn cmd_restore(args: &[String]) {
     need_admin(args);
     let rt = runtime();
     let result = rt.block_on(async {
-        if stale_only {
-            let _ = tokio::task::spawn_blocking(vpn::down_if_stale).await;
+        // Rute VPN dicabut dulu: internet kembali lewat jalur asli sebelum
+        // DNS dipulihkan, jadi tidak ada jendela tanpa koneksi.
+        let vpn_error = if stale_only {
+            tokio::task::spawn_blocking(vpn::down_if_stale)
+                .await
+                .map(|r| r.err())
+        } else {
+            tokio::task::spawn_blocking(vpn::down_persisted)
+                .await
+                .map(|r| r.err())
+        };
+        let warning = match vpn_error {
+            Ok(Some(e)) => {
+                crate::log::event(&format!("restore: rute VPN tidak dicabut: {e}"));
+                Some(format!("peringatan: rute VPN tidak berhasil dicabut: {e}"))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                crate::log::event(&format!("restore: tugas cabut rute VPN gagal: {e}"));
+                Some(format!("peringatan: tugas cabut rute VPN gagal: {e}"))
+            }
+        };
+        let restored = if stale_only {
             tokio::task::spawn_blocking(win::restore_if_stale).await
         } else {
-            // Rute VPN dicabut dulu: internet kembali lewat jalur asli sebelum
-            // DNS dipulihkan, jadi tidak ada jendela tanpa koneksi.
-            let _ = tokio::task::spawn_blocking(vpn::down_persisted).await;
             tokio::task::spawn_blocking(win::restore)
                 .await
                 .map(|r| r.map(Some))
-        }
+        };
+        restored.map(|r| {
+            r.map(|message| {
+                message.map(|m| match &warning {
+                    Some(w) => format!("{m}\n{w}"),
+                    None => m,
+                })
+            })
+        })
     });
     match result {
         Ok(Ok(Some(message))) => println!("{message}"),
@@ -221,10 +250,16 @@ fn cmd_doctor() {
         info("port 53 IPv6 loopback sedang dipakai");
     }
 
-    match rt.block_on(server::probe()) {
-        Ok(detail) => okay(&format!("proxy lokal menjawab — {detail}")),
-        Err(_) => info("proxy lokal tidak berjalan"),
-    }
+    let proxy_ok = match rt.block_on(server::probe()) {
+        Ok(detail) => {
+            okay(&format!("proxy lokal menjawab — {detail}"));
+            true
+        }
+        Err(_) => {
+            info("proxy lokal tidak berjalan");
+            false
+        }
+    };
 
     info(&format!("VPN: {}", vpn::status()));
 
@@ -236,7 +271,7 @@ fn cmd_doctor() {
                 provider_label(&state.provider),
                 state.ifaces.len()
             ));
-            if port_free {
+            if !proxy_ok {
                 fail(
                     "catatan masih ada tetapi tidak ada proxy di port 53 — jalankan `mydns restore`",
                 );
@@ -544,7 +579,13 @@ fn cmd_serve(provider_id: &str) {
         println!("Tekan Ctrl+C untuk berhenti.\n");
 
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move { bound.serve(stop_rx).await });
+        let proxy_task = tokio::spawn(async move { bound.serve(stop_rx).await });
+        tokio::spawn(async move {
+            match proxy_task.await {
+                Ok(()) => crate::log::event("serve: proxy listener berhenti"),
+                Err(e) => crate::log::event(&format!("serve: proxy task panic: {e}")),
+            }
+        });
         // Sender harus tetap hidup selama proxy berjalan: kalau ia di-drop,
         // `changed()` mengembalikan error dan semua loop listener berhenti.
         let _keepalive = stop_tx;

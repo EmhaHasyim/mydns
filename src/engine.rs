@@ -167,20 +167,11 @@ impl Engine {
     /// Urutan percobaan: protokol yang terakhir berhasil, lalu DoQ → DoH3 → DoH2.
     pub async fn resolve(&self, query: &[u8]) -> Result<(Vec<u8>, Proto), String> {
         let mut order = self.prov.protos();
-        {
-            let failures = guard(&self.failures);
-            let usable = |proto: &Proto| match failures.get(proto) {
-                // Dilewati hanya sementara: gangguan jaringan sesaat tidak
-                // boleh mematikan DoQ untuk seluruh sesi.
-                Some((count, when)) => *count < 2 || when.elapsed() > FAILURE_COOLDOWN,
-                None => true,
-            };
-            order.retain(usable);
-            // Kalau semua protokol sedang dikarantina, tetap coba semuanya
-            // daripada gagal tanpa satu percobaan pun.
-            if order.is_empty() {
-                order = self.prov.protos();
-            }
+        order.retain(|p| self.usable_proto(*p));
+        // Kalau semua protokol sedang dikarantina, tetap coba semuanya
+        // daripada gagal tanpa satu percobaan pun.
+        if order.is_empty() {
+            order = self.prov.protos();
         }
         if let Some(last) = *guard(&self.preferred)
             && let Some(pos) = order.iter().position(|p| *p == last)
@@ -199,23 +190,15 @@ impl Engine {
         let mut errors = Vec::new();
         for proto in order {
             match self.query_hedged(proto, query).await {
-                Ok((resp, used)) if response_matches(query, &resp) => {
+                Ok((resp, used)) => {
                     *guard(&self.preferred) = Some(used);
                     guard(&self.failures).remove(&used);
                     return Ok((resp, used));
                 }
-                // Respons kosong dan error diperlakukan sama: protokol dicatat
-                // gagal, lalu query lanjut ke protokol berikutnya.
-                Ok(_) => {
-                    self.note_failure(proto).await;
-                    errors.push(format!(
-                        "{}: respons tidak cocok dengan query",
-                        proto.label()
-                    ));
-                }
-                Err(e) => {
-                    self.note_failure(proto).await;
-                    errors.push(e);
+                // Cabang yang benar-benar gagal yang dicatat, bukan proto utama.
+                Err((failed, message)) => {
+                    self.note_failure(failed).await;
+                    errors.push(message);
                 }
             }
         }
@@ -231,16 +214,44 @@ impl Engine {
         }
     }
 
+    /// True kalau protokol belum dikarantina oleh failure cooldown.
+    fn usable_proto(&self, proto: Proto) -> bool {
+        match guard(&self.failures).get(&proto) {
+            // Dilewati hanya sementara: gangguan jaringan sesaat tidak
+            // boleh mematikan DoQ untuk seluruh sesi.
+            Some((count, when)) => *count < 2 || when.elapsed() > FAILURE_COOLDOWN,
+            None => true,
+        }
+    }
+
     /// Satu percobaan dengan hedging: kalau protokol utama belum menjawab
     /// dalam `HEDGE_DELAY`, protokol cadangan dijalankan bersamaan. Yang
     /// pertama menjawab dipakai, yang kalah dibuang. Ini menghilangkan
     /// sentuhan pertama yang lambat pada query pertama tiap sesi.
-    async fn query_hedged(&self, proto: Proto, query: &[u8]) -> Result<(Vec<u8>, Proto), String> {
+    async fn query_hedged(
+        &self,
+        proto: Proto,
+        query: &[u8],
+    ) -> Result<(Vec<u8>, Proto), (Proto, String)> {
         let mut others = self.prov.protos();
-        others.retain(|p| *p != proto);
+        others.retain(|p| *p != proto && self.usable_proto(*p));
+        // Worker DoH3 melayani satu query sekali jalan; saat sibuk ia bukan
+        // cadangan yang baik.
+        if self.h3_busy() {
+            others.retain(|p| *p != Proto::DoH3);
+        }
         let backup = others.first().copied();
         let Some(backup) = backup.filter(|_| !matches!(proto, Proto::DoH2)) else {
-            let resp = self.query_proto(proto, query).await?;
+            let resp = self
+                .query_proto(proto, query)
+                .await
+                .map_err(|e| (proto, e))?;
+            if !response_matches(query, &resp) {
+                return Err((
+                    proto,
+                    format!("{}: respons tidak cocok dengan query", proto.label()),
+                ));
+            }
             return Ok((resp, proto));
         };
 
@@ -259,38 +270,32 @@ impl Engine {
         // Penting: cabang yang menang HARUS menunggu future yang kalah.
         // Mem-poll ulang future yang sudah selesai akan memicu panic
         // "`async fn` resumed after completion".
-        let primary_error;
-        let hedge_error;
+        let primary_error: (Proto, String);
+        let hedge_error: (Proto, String);
         tokio::select! {
             result = &mut primary => {
                 match result {
                     Ok(resp) if response_matches(query, &resp) => return Ok((resp, proto)),
-                    Ok(_) => primary_error = format!("{}: respons tidak cocok dengan query", proto.label()),
-                    Err(e) => primary_error = format!("{}: {e}", proto.label()),
+                    Ok(_) => primary_error = (proto, format!("{}: respons tidak cocok dengan query", proto.label())),
+                    Err(e) => primary_error = (proto, format!("{}: {e}", proto.label())),
                 }
                 match tokio::time::timeout(QUERY_TIMEOUT, &mut hedge).await {
                     Ok(Ok(resp)) if response_matches(query, &resp) => Ok((resp, backup)),
-                    Ok(Ok(_)) => Err(format!(
-                        "{}: respons tidak cocok dengan query",
-                        backup.label()
-                    )),
-                    Ok(Err(e)) => Err(format!("{}: {e}", backup.label())),
+                    Ok(Ok(_)) => Err((backup, format!("{}: respons tidak cocok dengan query", backup.label()))),
+                    Ok(Err(e)) => Err((backup, format!("{}: {e}", backup.label()))),
                     Err(_) => Err(primary_error),
                 }
             }
             result = &mut hedge => {
                 match result {
                     Ok(resp) if response_matches(query, &resp) => return Ok((resp, backup)),
-                    Ok(_) => hedge_error = format!("{}: respons tidak cocok dengan query", backup.label()),
-                    Err(e) => hedge_error = format!("{}: {e}", backup.label()),
+                    Ok(_) => hedge_error = (backup, format!("{}: respons tidak cocok dengan query", backup.label())),
+                    Err(e) => hedge_error = (backup, format!("{}: {e}", backup.label())),
                 }
                 match tokio::time::timeout(QUERY_TIMEOUT, &mut primary).await {
                     Ok(Ok(resp)) if response_matches(query, &resp) => Ok((resp, proto)),
-                    Ok(Ok(_)) => Err(format!(
-                        "{}: respons tidak cocok dengan query",
-                        proto.label()
-                    )),
-                    Ok(Err(e)) => Err(format!("{}: {e}", proto.label())),
+                    Ok(Ok(_)) => Err((proto, format!("{}: respons tidak cocok dengan query", proto.label()))),
+                    Ok(Err(e)) => Err((proto, format!("{}: {e}", proto.label()))),
                     Err(_) => Err(hedge_error),
                 }
             }
@@ -409,23 +414,26 @@ impl Engine {
 
     async fn doq_query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         let conn = self.doq_conn().await?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| format!("buka stream: {e}"))?;
+        let raw = tokio::time::timeout(QUERY_TIMEOUT, async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| format!("buka stream: {e}"))?;
 
-        let mut framed = Vec::with_capacity(query.len() + 2);
-        framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-        framed.extend_from_slice(query);
-        send.write_all(&framed)
-            .await
-            .map_err(|e| format!("kirim: {e}"))?;
-        let _ = send.finish();
+            let mut framed = Vec::with_capacity(query.len() + 2);
+            framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+            framed.extend_from_slice(query);
+            send.write_all(&framed)
+                .await
+                .map_err(|e| format!("kirim: {e}"))?;
+            let _ = send.finish();
 
-        let raw = tokio::time::timeout(QUERY_TIMEOUT, recv.read_to_end(MAX_MESSAGE))
-            .await
-            .map_err(|_| "timeout".to_string())?
-            .map_err(|e| format!("baca: {e}"))?;
+            recv.read_to_end(MAX_MESSAGE)
+                .await
+                .map_err(|e| format!("baca: {e}"))
+        })
+        .await
+        .map_err(|_| "timeout".to_string())??;
         if raw.len() < 2 {
             return Err("respons terlalu pendek".to_string());
         }
@@ -468,8 +476,9 @@ impl Engine {
     async fn doh3_query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         let tx = self.h3_sender()?;
         let (otx, orx) = oneshot::channel();
-        tx.send((query.to_vec(), otx))
+        tokio::time::timeout(QUERY_TIMEOUT, tx.send((query.to_vec(), otx)))
             .await
+            .map_err(|_| "timeout".to_string())?
             .map_err(|_| "worker HTTP/3 tidak berjalan".to_string())?;
         match tokio::time::timeout(QUERY_TIMEOUT, orx).await {
             Ok(Ok(result)) => result,
@@ -702,14 +711,9 @@ pub fn build_query(domain: &str) -> Vec<u8> {
 
 // ---------- worker HTTP/3 ----------
 
-/// Satu worker = satu koneksi HTTP/3. Job diambil dari antrean bersama, lalu
-/// diproses berurutan di dalam worker ini (pola yang terbukti stabil untuk
-/// `h3` 0.0.8); paralelisme datang dari beberapa worker sekaligus.
-///
-/// Satu worker = satu koneksi HTTP/3, dan job di koneksi itu diproses
-/// berurutan. Paralelisme datang dari beberapa worker (`H3_MAX_CONNECTIONS`),
-/// bukan dari beberapa request di satu koneksi: `h3` 0.0.8 berhenti menerima
-/// jawaban untuk sebagian server kalau satu `SendRequest` dipakai bersamaan.
+/// Satu worker = satu koneksi HTTP/3. Job diproses berurutan karena `h3` 0.0.8
+/// berhenti menjawab untuk sebagian server kalau satu `SendRequest` dipakai
+/// bersamaan.
 async fn h3_worker(
     ep: quinn::Endpoint,
     ep6: Option<quinn::Endpoint>,
@@ -731,7 +735,13 @@ async fn h3_worker(
     };
 
     while let Some((query, reply)) = rx.recv().await {
-        let result = h3_roundtrip(&mut sender, url, Bytes::from(query)).await;
+        let result = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            h3_roundtrip(&mut sender, url, Bytes::from(query)),
+        )
+        .await
+        .map_err(|_| "timeout".to_string())
+        .and_then(|r| r);
         let failed = result.is_err();
         let _ = reply.send(result);
         // Koneksi yang sudah error tidak dipakai lagi: worker keluar, dan
@@ -828,10 +838,10 @@ where
     let mut out = Vec::new();
     while let Some(mut chunk) = stream.recv_data().await.map_err(|e| format!("baca: {e}"))? {
         let n = chunk.remaining();
-        out.extend_from_slice(&chunk.copy_to_bytes(n));
-        if out.len() > MAX_MESSAGE {
-            break;
+        if out.len() + n > MAX_MESSAGE {
+            return Err("respons DoH3 melebihi batas".into());
         }
+        out.extend_from_slice(&chunk.copy_to_bytes(n));
     }
     Ok(out)
 }

@@ -15,14 +15,21 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
 use tokio::sync::{mpsc, watch};
 
-/// Nama pipe. Satu daemon per sesi pengguna.
-pub const PIPE: &str = r"\\.\pipe\mydns-daemon";
+/// Nama pipe, diskop sesi login: satu daemon per sesi pengguna.
+fn pipe_name() -> String {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let mut sid = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut sid) };
+    let sid = if ok != 0 { sid } else { 0 };
+    format!(r"\\.\pipe\mydns-daemon-{sid}")
+}
 
 /// DACL eksplisit untuk pipe: pemilik pipe (user yang menjalankan daemon),
 /// SYSTEM, dan Administrators. Tanpa ini pipe memakai default DACL token, yang
 /// bisa memberi user lain akses ke perintah `stop`/`restore`.
 fn create_pipe(first: bool) -> std::io::Result<NamedPipeServer> {
-    create_pipe_named(first, PIPE)
+    create_pipe_named(first, &pipe_name())
 }
 
 fn create_pipe_named(first: bool, name: &str) -> std::io::Result<NamedPipeServer> {
@@ -46,7 +53,7 @@ fn create_pipe_named(first: bool, name: &str) -> std::io::Result<NamedPipeServer
         )
     };
     if ok == 0 || sd.is_null() {
-        return options.create(name);
+        return Err(std::io::Error::other("gagal mengonversi SDDL untuk pipe"));
     }
     let mut attrs = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -94,14 +101,21 @@ pub fn control(command: &str) -> Result<String, String> {
 
     let rt = crate::runtime();
     rt.block_on(async move {
-        let mut client = ClientOptions::new().open(PIPE).map_err(|_| {
+        let mut client = ClientOptions::new().open(pipe_name()).map_err(|_| {
             "daemon tidak berjalan (jalankan `mydns daemon <provider>` dulu)".to_string()
         })?;
-        client
-            .write_all(format!("{command}\n").as_bytes())
-            .await
-            .map_err(|e| format!("gagal mengirim perintah: {e}"))?;
-        client.flush().await.map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            client
+                .write_all(format!("{command}\n").as_bytes())
+                .await
+                .map_err(|e| format!("gagal mengirim perintah: {e}"))?;
+            client
+                .flush()
+                .await
+                .map_err(|e| format!("gagal mengirim perintah: {e}"))
+        })
+        .await
+        .map_err(|_| "daemon tidak menjawab dalam 5 detik".to_string())??;
 
         let mut reader = BufReader::new(client);
         let mut line = String::new();
@@ -118,12 +132,7 @@ async fn serve(provider: &'static providers::Provider) -> Result<(), String> {
     // hidup, sehingga daemon kedua ditolak alih-alih berebut port 53.
     let first = match create_pipe(true) {
         Ok(server) => server,
-        Err(e) => {
-            return Err(format!(
-                "daemon lain sudah berjalan (pipe {} tidak bisa dibuat: {e})",
-                PIPE
-            ));
-        }
+        Err(e) => return Err(format!("pipe {} tidak bisa dibuat: {e}", pipe_name())),
     };
 
     let log = Arc::new(Log::new());
@@ -132,7 +141,13 @@ async fn serve(provider: &'static providers::Provider) -> Result<(), String> {
     let v6 = bound.v6;
     let proxy = bound.proxy.clone();
     let (stop_tx, stop_rx) = watch::channel(false);
-    tokio::spawn(async move { bound.serve(stop_rx).await });
+    let proxy_task = tokio::spawn(async move { bound.serve(stop_rx).await });
+    tokio::spawn(async move {
+        match proxy_task.await {
+            Ok(()) => log::event("daemon: proxy listener berhenti"),
+            Err(e) => log::event(&format!("daemon: proxy task panic: {e}")),
+        }
+    });
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(8);
     let started = Instant::now();
@@ -151,6 +166,12 @@ async fn serve(provider: &'static providers::Provider) -> Result<(), String> {
         server::ADDR_V4,
         server::ADDR_V6
     );
+    // Jaring pengaman kalau proses dibunuh atau panic — sama seperti cmd_tui.
+    // Dipasang setelah proxy dan pipe siap supaya watchdog tidak memulihkan
+    // DNS sebelum keadaan sempat ditulis.
+    win::install_exit_guard();
+    win::spawn_watchdog();
+
     let id = provider.id.to_string();
     let mut applied = false;
     match tokio::task::spawn_blocking(move || win::apply(&id, v6)).await {

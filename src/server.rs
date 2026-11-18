@@ -14,7 +14,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
 
 pub const ADDR_V4: &str = "127.0.0.1:53";
 pub const ADDR_V6: &str = "[::1]:53";
@@ -30,6 +30,8 @@ const MAX_CACHE_ENTRY_BYTES: usize = 16 * 1024;
 /// menggantung), query lain diteruskan sendiri daripada ikut menunggu sampai
 /// klien kehabisan waktu.
 const GATE_WAIT: Duration = Duration::from_secs(3);
+/// Batas koneksi TCP bersamaan untuk kedua listener (v4 + v6).
+const MAX_TCP_CONNS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
@@ -46,8 +48,8 @@ struct Key {
 }
 
 struct Entry {
-    /// Jawaban mentah. `Arc` supaya cache hit tidak mengalokasikan ulang
-    /// salinan paket — yang dikirim ke klien hanya 2 byte ID di header.
+    /// Jawaban mentah. `Arc` menghindari salinan mentah saat cache hit;
+    /// header/TTL tetap dipatch lewat parse/serialisasi ulang di `cached_response`.
     bytes: Arc<[u8]>,
     expires: Instant,
 }
@@ -95,6 +97,8 @@ pub struct Proxy {
     /// bersamaan. Hanya `Weak` yang disimpan: entri hilang sendiri begitu
     /// tidak ada query yang memegangnya.
     inflight: Mutex<HashMap<Key, Weak<Mutex<()>>>>,
+    /// Pembatas koneksi TCP aktif, dipakai bersama oleh listener v4 dan v6.
+    tcp_permits: Arc<Semaphore>,
     hits: AtomicU64,
     misses: AtomicU64,
     forwards: AtomicU64,
@@ -107,6 +111,7 @@ impl Proxy {
             log,
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
+            tcp_permits: Arc::new(Semaphore::new(MAX_TCP_CONNS)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             forwards: AtomicU64::new(0),
@@ -163,7 +168,9 @@ impl Proxy {
         self.misses.fetch_add(1, Ordering::Relaxed);
 
         if !cacheable {
-            let response = self.forward(request, &key, &name, qtype).await;
+            // Jangan simpan: jawaban bergantung pada opsi/konteks klien dan
+            // akan menimpa entri cacheable dengan kunci yang sama.
+            let response = self.forward(request, &key, &name, qtype, false).await;
             return Some(fit_udp(response, &parsed, over_tcp));
         }
 
@@ -178,21 +185,31 @@ impl Proxy {
                 self.log_query(&name, qtype, "gabung", 0);
                 cached_response(&bytes, id, remaining, question)
             }
-            None => self.forward(request, &key, &name, qtype).await,
+            None => self.forward(request, &key, &name, qtype, true).await,
         };
         drop(guard);
         self.leave_flight(&key, &gate).await;
         Some(fit_udp(response, &parsed, over_tcp))
     }
 
-    /// Teruskan query ke upstream, catat log, dan simpan hasilnya di cache.
-    async fn forward(&self, request: &[u8], key: &Key, name: &str, qtype: RecordType) -> Vec<u8> {
+    /// Teruskan query ke upstream dan catat log. Simpan hasil hanya untuk query
+    /// cacheable, supaya jawaban khusus klien tidak menimpa entri kunci yang sama.
+    async fn forward(
+        &self,
+        request: &[u8],
+        key: &Key,
+        name: &str,
+        qtype: RecordType,
+        store: bool,
+    ) -> Vec<u8> {
         self.forwards.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         match self.engine.resolve(request).await {
             Ok((response, proto)) => {
                 self.log_query(name, qtype, proto.label(), started.elapsed().as_millis());
-                self.store_cache(key, &response).await;
+                if store {
+                    self.store_cache(key, &response).await;
+                }
                 response
             }
             Err(e) => {
@@ -213,9 +230,7 @@ impl Proxy {
         let cache = self.cache.lock().await;
         let entry = cache.get(key)?;
         let left = entry.expires.checked_duration_since(Instant::now())?;
-        let remaining = u32::try_from(left.as_millis().div_ceil(1000))
-            .unwrap_or(u32::MAX)
-            .max(1);
+        let remaining = u32::try_from(left.as_secs()).unwrap_or(u32::MAX).max(1);
         Some((entry.bytes.clone(), remaining))
     }
 
@@ -360,7 +375,7 @@ fn servfail(request: &[u8]) -> Vec<u8> {
     if out.len() < 12 {
         return out;
     }
-    out[2] = (out[2] & 0x01) | 0x80; // QR = 1
+    out[2] = (out[2] & 0x79) | 0x80; // QR = 1, opcode + RD dipertahankan
     out[3] = (out[3] & 0xF0) | 0x02; // RCODE = SERVFAIL
     for byte in out.iter_mut().take(12).skip(6) {
         *byte = 0; // kosongkan hitungan AN/NS/AR
@@ -525,7 +540,17 @@ async fn tcp_loop(listener: Arc<TcpListener>, proxy: Arc<Proxy>, mut stop: watch
             accepted = listener.accept() => {
                 let Ok((stream, _peer)) = accepted else { continue };
                 let proxy = proxy.clone();
-                tokio::spawn(async move { serve_tcp(stream, proxy).await });
+                // Tunggu slot sebelum spawn; permit dilepas saat task selesai.
+                // shortcut: saat 64 slot penuh accept ikut menunggu (maks ~10s, timeout
+                // serve_tcp); ganti try_acquire + tutup koneksi kalau perlu non-blokir.
+                let permit = Arc::clone(&proxy.tcp_permits)
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore tidak pernah ditutup");
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    serve_tcp(stream, proxy).await
+                });
             }
         }
     }

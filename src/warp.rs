@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use zeroize::{Zeroize, Zeroizing};
 
 const API_HOST: &str = "api.cloudflareclient.com";
 const API_VERSION: &str = "v0a4471";
@@ -51,10 +52,13 @@ const MAX_API_BYTES: usize = 256 * 1024;
 /// Penanda nilai yang dienkripsi DPAPI di `warp.json`.
 const SECRET_PREFIX: &str = "dpapi:";
 
+/// Port lokal → (ID transaksi DNS, penunggu jawaban).
+type Pending = Arc<Mutex<HashMap<u16, (u16, oneshot::Sender<Vec<u8>>)>>>;
+
 // ── berkas konfigurasi ──────────────────────────────────────────────────
 
 /// Hasil registrasi + enrollment, disimpan supaya tidak perlu daftar ulang.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub device_id: String,
     pub token: String,
@@ -76,6 +80,27 @@ pub struct Config {
     /// field ini berisi base64 biasa dan tetap bisa dibaca.
     #[serde(default)]
     pub protected: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Token dan kunci privat sudah terdekripsi di memori: jangan pernah
+        // tercetak lewat `{:?}` (log, panic, atau diagnostik).
+        f.debug_struct("Config")
+            .field("device_id", &self.device_id)
+            .field("token", &"<redacted>")
+            .field("private_key", &"<redacted>")
+            .field("peer_public_key", &self.peer_public_key)
+            .field("endpoint_v4", &self.endpoint_v4)
+            .field("endpoint_v6", &self.endpoint_v6)
+            .field("ipv4", &self.ipv4)
+            .field("ipv6", &self.ipv6)
+            .field("sni", &self.sni)
+            .field("authority", &self.authority)
+            .field("registered_at", &self.registered_at)
+            .field("protected", &self.protected)
+            .finish()
+    }
 }
 
 fn default_sni() -> String {
@@ -226,8 +251,21 @@ fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>, String> {
         return Err(format!("DPAPI gagal: {}", std::io::Error::last_os_error()));
     }
 
-    let bytes =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    if output.pbData.is_null() || output.cbData == 0 {
+        if !output.pbData.is_null() {
+            unsafe {
+                LocalFree(output.pbData as *mut core::ffi::c_void);
+            }
+        }
+        return Ok(Vec::new());
+    }
+
+    let bytes = unsafe {
+        let plain = std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize);
+        let copied = plain.to_vec();
+        plain.zeroize(); // salinan plaintext milik DPAPI dihapus sebelum dibebaskan
+        copied
+    };
     unsafe {
         LocalFree(output.pbData as *mut core::ffi::c_void);
     }
@@ -607,15 +645,27 @@ fn dechunk(raw: &[u8]) -> Result<Vec<u8>, String> {
             .windows(2)
             .position(|w| w == b"\r\n")
             .ok_or_else(|| "chunk tanpa akhir baris".to_string())?;
-        let size_text = String::from_utf8_lossy(&raw[pos..pos + line_end]);
+        let header_end = pos
+            .checked_add(line_end)
+            .ok_or_else(|| "header chunk meluap".to_string())?;
+        let size_text = String::from_utf8_lossy(&raw[pos..header_end]);
         let size = usize::from_str_radix(size_text.trim(), 16)
             .map_err(|_| format!("ukuran chunk tidak valid: {size_text}"))?;
-        pos += line_end + 2;
+        pos = pos
+            .checked_add(line_end)
+            .and_then(|p| p.checked_add(2))
+            .ok_or_else(|| "posisi chunk meluap".to_string())?;
         if size == 0 {
             break;
         }
-        out.extend_from_slice(&raw[pos..(pos + size).min(raw.len())]);
-        pos += size + 2;
+        let end = pos
+            .checked_add(size)
+            .ok_or_else(|| "ukuran chunk meluap".to_string())?;
+        out.extend_from_slice(&raw[pos..end.min(raw.len())]);
+        pos = pos
+            .checked_add(size)
+            .and_then(|p| p.checked_add(2))
+            .ok_or_else(|| "posisi chunk meluap".to_string())?;
     }
     Ok(out)
 }
@@ -696,11 +746,13 @@ impl ServerCertVerifier for PinnedKey {
 /// yang sudah di-enroll, dan verifikasi server dengan pinning.
 fn tunnel_tls(config: &Config) -> Result<rustls::ClientConfig, String> {
     let rng = ring::rand::SystemRandom::new();
-    let pkcs8 = b64::decode(&config.private_key)?;
+    // Kunci privat plaintext dihapus dari memori saat fungsi keluar, termasuk
+    // lewat jalur error.
+    let pkcs8 = Zeroizing::new(b64::decode(&config.private_key)?);
     let algo = &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING;
-    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(algo, &pkcs8, &rng)
+    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(algo, pkcs8.as_slice(), &rng)
         .map_err(|_| "kunci privat P-256 di warp.json tidak valid".to_string())?;
-    let spki = spki_der(&ec_public_point(&pkcs8)?)?;
+    let spki = spki_der(&ec_public_point(pkcs8.as_slice())?)?;
     let (cert, _) = self_signed_cert(&pair, &spki, "mydns", &rng)?;
 
     let expected = decode_spki(&config.peer_public_key)?;
@@ -717,7 +769,9 @@ fn tunnel_tls(config: &Config) -> Result<rustls::ClientConfig, String> {
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(
             vec![CertificateDer::from(cert)],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8)),
+            // `PrivatePkcs8KeyDer` butuh Vec owning; titik terakhir sebelum
+            // kunci diserahkan ke rustls.
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec())),
         )
         .map_err(|e| format!("sertifikat klien tidak valid: {e}"))?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
@@ -932,7 +986,8 @@ pub struct Tunnel {
     /// HTTP Datagram (RFC 9297).
     quarter: u64,
     src: Ipv4Addr,
-    pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
+    /// Port lokal → (ID transaksi DNS, penunggu jawaban).
+    pending: Pending,
     next_port: AtomicU16,
     /// Penerima paket IP mentah, dipakai mode VPN penuh. Tanpa penerima,
     /// paket selain jawaban DNS dibuang seperti sebelumnya.
@@ -951,8 +1006,7 @@ impl Tunnel {
         for addr in endpoints {
             match Self::connect_addr(config, addr).await {
                 Ok((endpoint, conn, h3, quarter)) => {
-                    let pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>> =
-                        Arc::new(Mutex::new(HashMap::new()));
+                    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
                     let raw = Arc::new(std::sync::Mutex::new(None));
 
                     spawn_reader(conn.clone(), Arc::clone(&pending), Arc::clone(&raw));
@@ -1053,6 +1107,13 @@ impl Tunnel {
         }
 
         let port = self.allocate_port().await;
+        // ID transaksi ikut disimpan supaya jawaban terlambat dari query lama
+        // tidak disalahserahkan ke query baru yang memakai port yang sama.
+        let id = u16::from_be_bytes(
+            *query
+                .first_chunk::<2>()
+                .ok_or_else(|| "query DNS terlalu pendek".to_string())?,
+        );
         let packet = ipv4_udp_packet(self.src, TUNNEL_DNS, port, 53, query);
 
         let mut datagram = Vec::with_capacity(packet.len() + 2);
@@ -1061,7 +1122,7 @@ impl Tunnel {
         datagram.extend_from_slice(&packet);
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(port, tx);
+        self.pending.lock().await.insert(port, (id, tx));
 
         if let Err(e) = self.conn.send_datagram(Bytes::from(datagram)) {
             self.pending.lock().await.remove(&port);
@@ -1370,7 +1431,7 @@ fn static_status(index: u64) -> Option<u16> {
 /// (mode VPN penuh) diteruskan ke adapter TUN lewat `raw`.
 fn spawn_reader(
     conn: quinn::Connection,
-    pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
+    pending: Pending,
     raw: Arc<std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
 ) {
     tokio::spawn(async move {
@@ -1385,11 +1446,19 @@ fn spawn_reader(
             let Some((_, packet)) = get_varint(rest) else {
                 continue;
             };
-            if let Some((port, dns)) = udp_to_port(packet, 53)
-                && let Some(tx) = pending.lock().await.remove(&port)
-            {
-                let _ = tx.send(dns.to_vec());
-                continue;
+            if let Some((port, dns)) = udp_to_port(packet, 53) {
+                let mut map = pending.lock().await;
+                let expected = map.get(&port).map(|(id, _)| *id);
+                let cocok = expected.is_some_and(|id| {
+                    dns.first_chunk::<2>()
+                        .is_some_and(|got| u16::from_be_bytes(*got) == id)
+                });
+                if cocok && let Some((_, tx)) = map.remove(&port) {
+                    let _ = tx.send(dns.to_vec());
+                    continue;
+                }
+                // Jawaban yang tidak cocok (mis. terlambat) jatuh ke TUN seperti
+                // paket UDP lainnya, dan tidak menimpa penunggu port tersebut.
             }
             // Paket IPv4 dan IPv6 ditulis ke adapter TUN. Rute v6 hanya ada
             // kalau WARP memberi alamat v6, jadi paket v6 tanpa rute tidak akan
@@ -1485,11 +1554,11 @@ fn udp_to_port(packet: &[u8], expect_src: u16) -> Option<(u16, &[u8])> {
 
 fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for chunk in chunks {
+        sum += u16::from_be_bytes(*chunk) as u32;
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += (*last as u32) << 8;
     }
     while sum >> 16 != 0 {
@@ -1594,6 +1663,12 @@ mod tests {
         ] {
             assert_eq!(b64::decode(&b64::encode(sample)).unwrap(), sample);
         }
+    }
+
+    #[test]
+    fn dechunk_menolak_ukuran_meluap() {
+        let raw = format!("{:x}\r\nx", usize::MAX);
+        assert!(dechunk(raw.as_bytes()).is_err());
     }
 
     #[test]

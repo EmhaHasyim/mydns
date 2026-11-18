@@ -16,6 +16,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Jarak pemeriksaan DNS adapter. Sepuluh detik masih cepat untuk kasus yang
@@ -44,6 +45,10 @@ const WARN: Color = Color::Rgb(251, 191, 36);
 const ERR: Color = Color::Rgb(248, 113, 113);
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// ponytail: flag global cukup karena TUI ini satu proses; dipakai supaya apply
+// yang masih berjalan tidak mengubah DNS setelah pembersihan saat keluar.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 // ── ukuran tata letak ──────────────────────────────────────────────────
 const MIN_WIDTH: u16 = 60;
@@ -270,6 +275,9 @@ impl App {
 
     /// Satu tombol untuk pilihan biner: dengan VPN, atau DNS saja.
     fn toggle_vpn(&mut self) {
+        if self.busy {
+            return;
+        }
         if self.vpn {
             self.vpn = false;
             self.clear_dns();
@@ -400,6 +408,8 @@ impl App {
                 // Gagal berarti tidak ada tunnel yang tersisa: jangan biarkan
                 // header mengaku VPN menyala.
                 self.vpn = false;
+                self.exit_ip = None;
+                self.dns_now = "setelan DNS asli dipulihkan".to_string();
                 crate::log::event(&format!("gagal: {error}"));
                 self.status = error;
             }
@@ -1059,6 +1069,22 @@ async fn apply_flow(
     let vpn_running = vpn.is_some();
 
     // 4. Baru arahkan adapter ke loopback.
+    // Kalau pengguna sudah keluar, pembersihan di `run` sedang berjalan:
+    // jangan arahkan adapter setelah DNS dipulihkan.
+    if QUITTING.load(Ordering::Relaxed) {
+        if let Some(vpn) = vpn.take() {
+            let _ = vpn.down().await;
+        }
+        // Pemulihan DNS sudah jadi tanggung jawab pembersihan di `run`.
+        abort(
+            stop_tx,
+            proxy_task,
+            tx,
+            "dibatalkan saat keluar".to_string(),
+        )
+        .await;
+        return;
+    }
     let id = provider.id;
     let applied = tokio::task::spawn_blocking(move || win::apply(id, listen_v6)).await;
     let adapters = match applied {
@@ -1197,6 +1223,15 @@ async fn apply_flow(
         }
     });
 
+    // Keluar di tengah jalan: jangan simpan sesi yang akan hidup lebih lama
+    // dari pembersihan di `run`.
+    if QUITTING.load(Ordering::Relaxed) {
+        let _ = stop_tx.send(true);
+        if let Some(vpn) = vpn.take() {
+            let _ = vpn.down().await;
+        }
+        return;
+    }
     *session.lock().await = Some(Session {
         stop: stop_tx,
         proxy_task,
@@ -1225,6 +1260,15 @@ async fn apply_flow(
         adapters: adapters.len(),
         exit_ip,
     });
+}
+
+/// Kembalikan terminal juga saat panic, bukan hanya saat keluar normal.
+struct RestoreOnDrop;
+
+impl Drop for RestoreOnDrop {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
 }
 
 pub fn run(
@@ -1279,6 +1323,7 @@ pub fn run(
     }
 
     let mut terminal = ratatui::init();
+    let _restore = RestoreOnDrop;
     let outcome = (|| -> std::io::Result<()> {
         // Frame hanya digambar saat ada yang berubah (tombol, pesan, ukuran
         // jendela, atau spinner yang sedang berjalan). TUI yang menganggur
@@ -1315,14 +1360,13 @@ pub fn run(
         }
         Ok(())
     })();
-    ratatui::restore();
+    QUITTING.store(true, Ordering::Relaxed);
 
     // Apa pun cara keluarnya (q / x / Esc / Ctrl+C), DNS dikembalikan ke setelan
     // semula. Catatan dari sesi sebelumnya juga dibersihkan, supaya tidak ada
     // DNS yang tertinggal menunjuk proxy yang sudah mati.
-    let session_for_cleanup = session.clone();
     app.rt.block_on(async move {
-        stop_session(&session_for_cleanup).await;
+        stop_session(&session).await;
         // Sisa rute dari sesi lama (mis. setelah crash) juga dicabut di sini.
         let _ = tokio::task::spawn_blocking(crate::vpn::down_persisted).await;
         if win::load_state().is_some() {

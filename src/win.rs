@@ -7,6 +7,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Proses anak (powershell, ipconfig, schtasks) tidak boleh memunculkan jendela
@@ -71,21 +72,28 @@ pub struct SavedVpn {
 /// seperti `%ProgramData%`, jadi user lokal tidak bisa mengarahkan state ke
 /// folder miliknya sebelum proses elevated menulis.
 fn program_data() -> PathBuf {
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+    static CACHE: OnceLock<PathBuf> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            use windows_sys::Win32::System::Com::CoTaskMemFree;
+            use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
 
-    let mut ptr: *mut u16 = std::ptr::null_mut();
-    let hr =
-        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut ptr) };
-    if hr >= 0 && !ptr.is_null() {
-        let path = unsafe { wide_string(ptr) };
-        unsafe { CoTaskMemFree(ptr as *const std::ffi::c_void) };
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
-    PathBuf::from(base)
+            let mut ptr: *mut u16 = std::ptr::null_mut();
+            let hr = unsafe {
+                SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut ptr)
+            };
+            if hr >= 0 && !ptr.is_null() {
+                let path = unsafe { wide_string(ptr) };
+                unsafe { CoTaskMemFree(ptr as *const std::ffi::c_void) };
+                if !path.is_empty() {
+                    return PathBuf::from(path);
+                }
+            }
+            let base =
+                std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+            PathBuf::from(base)
+        })
+        .clone()
 }
 
 pub fn state_path() -> PathBuf {
@@ -208,7 +216,9 @@ pub fn save_state(s: &Saved) -> Result<(), String> {
     // Tulis ke file sementara di direktori yang sama, fsync, lalu ganti secara
     // atomik. Crash di tengah penulisan tidak boleh meninggalkan JSON korup
     // yang membuat restore melewati pemulihan DNS.
-    let tmp = path.with_extension("json.tmp");
+    // Sertakan PID supaya dua proses yang menulis bersamaan tidak memakai
+    // file sementara yang sama.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let mut file =
         std::fs::File::create(&tmp).map_err(|e| format!("gagal menulis {}: {e}", tmp.display()))?;
     use std::io::Write;
@@ -231,13 +241,17 @@ pub fn clear_state() {
 /// Proses ini sering berjalan elevated; `Command::new("powershell")` bisa
 /// menemukan file yang ditanam di folder aplikasi atau CWD.
 pub(crate) fn system32_exe(name: &str) -> PathBuf {
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-    let mut buf = vec![0u16; 1024];
-    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
-    if len == 0 || len as usize >= buf.len() {
-        return PathBuf::from(r"C:\Windows\System32").join(name);
-    }
-    PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])).join(name)
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+        let mut buf = vec![0u16; 1024];
+        let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+        if len == 0 || len as usize >= buf.len() {
+            return PathBuf::from(r"C:\Windows\System32");
+        }
+        PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]))
+    })
+    .join(name)
 }
 
 pub(crate) fn run_ps(script: &str) -> Result<String, String> {
@@ -347,7 +361,7 @@ fn list_adapters_fast() -> Option<Vec<Adapter>> {
             while !entry.is_null() {
                 // SAFETY: setiap node dalam daftar diisi oleh API yang sama.
                 let node = unsafe { &*entry };
-                if let Some(ip) = unsafe { sockaddr_ip(node.Address.lpSockaddr) } {
+                if let Some(ip) = unsafe { sockaddr_ip(&node.Address) } {
                     match ip {
                         IpAddr::V4(addr) => v4.push(addr.to_string()),
                         IpAddr::V6(addr) => {
@@ -396,19 +410,19 @@ unsafe fn wide_string(ptr: *const u16) -> String {
 /// Offset dibaca langsung dari memori karena layout sockaddr dijamin ABIs Winsock:
 /// IPv4 → alamat di byte 4..8, IPv6 → alamat di byte 8..24.
 unsafe fn sockaddr_ip(
-    sa: *const windows_sys::Win32::Networking::WinSock::SOCKADDR,
+    sa: &windows_sys::Win32::Networking::WinSock::SOCKET_ADDRESS,
 ) -> Option<IpAddr> {
-    if sa.is_null() {
+    if sa.lpSockaddr.is_null() || sa.iSockaddrLength < 2 {
         return None;
     }
-    let base = sa as *const u8;
-    match unsafe { (*sa).sa_family } {
-        2 => {
+    let base = sa.lpSockaddr as *const u8;
+    match unsafe { (*sa.lpSockaddr).sa_family } {
+        2 if sa.iSockaddrLength >= 8 => {
             let mut octets = [0u8; 4];
             unsafe { std::ptr::copy_nonoverlapping(base.add(4), octets.as_mut_ptr(), 4) };
             Some(IpAddr::V4(octets.into()))
         }
-        23 => {
+        23 if sa.iSockaddrLength >= 24 => {
             let mut octets = [0u8; 16];
             unsafe { std::ptr::copy_nonoverlapping(base.add(8), octets.as_mut_ptr(), 16) };
             Some(IpAddr::V6(octets.into()))
@@ -458,8 +472,12 @@ fn is_link_local(server: &str) -> bool {
         Ok(IpAddr::V6(addr)) => addr.is_unicast_link_local(),
         Ok(IpAddr::V4(_)) => false,
         // PowerShell kadang menambahkan zone id (`fe80::1%12`) yang tidak bisa
-        // diparse sebagai IpAddr.
-        Err(_) => server.to_ascii_lowercase().starts_with("fe80:"),
+        // diparse sebagai IpAddr. Buang zone-nya lalu cek numerik blok fe80::/10.
+        Err(_) => server
+            .split('%')
+            .next()
+            .and_then(|s| s.parse::<std::net::Ipv6Addr>().ok())
+            .is_some_and(|addr| addr.segments()[0] & 0xFFC0 == 0xFE80),
     }
 }
 
@@ -681,6 +699,12 @@ pub fn restore() -> Result<String, String> {
     };
 
     if touched == 0 {
+        // Tanpa adapter yang cocok (jaringan sedang mati / index berubah) state
+        // tetap disimpan: menghapusnya akan menghilangkan satu-satunya catatan
+        // DNS asli. Hanya hapus kalau memang tidak ada state sejak awal.
+        if saved.is_some() {
+            return Ok("Restore gagal: tidak ada adapter yang cocok ditemukan".to_string());
+        }
         clear_state();
         return Ok(
             "DNS sudah kembali ke setelan default (tidak ada yang perlu diubah)".to_string(),
@@ -959,17 +983,28 @@ pub fn vpn_clear_state() {
 /// Tunggu proses lain benar-benar selesai. `false` kalau prosesnya sudah tidak
 /// ada saat hendak dibuka.
 pub fn wait_for_process(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GetLastError, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
 
     // Hak akses standar untuk menunggu handle (tidak diekspor windows-sys di
     // modul Foundation, jadi ditulis langsung).
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const INFINITE: u32 = 0xFFFF_FFFF;
     unsafe {
-        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
         if handle.is_null() {
-            return false;
+            // Bedakan induk yang memang sudah tidak ada dari kegagalan akses.
+            // Kalau tidak bisa dipastikan, anggap sudah pergi dan biarkan
+            // watchdog tetap mencoba restore (restore_if_stale aman dipanggil).
+            let err = GetLastError();
+            if err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_FOUND {
+                return false;
+            }
+            return true;
         }
         let code = WaitForSingleObject(handle, INFINITE);
         CloseHandle(handle);
@@ -1050,17 +1085,25 @@ pub fn autostart_target_valid() -> Option<bool> {
     if xml.is_empty() {
         return None;
     }
+    // XML keluaran schtasks meng-escape karakter path yang umum.
+    let xml = xml
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
     Some(xml.contains(&exe))
 }
 
 /// Keluaran alat konsol Windows bisa UTF-16LE atau UTF-8 tergantung versi.
 fn decode_console(bytes: &[u8]) -> String {
-    let utf16 = bytes.len() > 4 && bytes[1] == 0 && bytes[3] == 0;
+    // BOM UTF-16LE (FF FE) lebih pasti daripada heuristik byte nol.
+    let bom = bytes.starts_with(&[0xFF, 0xFE]);
+    let utf16 = bom || (bytes.len() > 4 && bytes[1] == 0 && bytes[3] == 0);
     if utf16 {
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let payload = if bom { &bytes[2..] } else { bytes };
+        let (pairs, _) = payload.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(bytes).to_string()
@@ -1180,7 +1223,7 @@ unsafe extern "system" fn exit_handler(_ctrl_type: u32) -> i32 {
         && let Ok(exe) = std::env::current_exe()
     {
         let _ = Command::new(exe)
-            .arg("restore")
+            .args(["restore", "--if-stale"])
             .creation_flags(DETACHED_PROCESS)
             .spawn();
     }
@@ -1198,6 +1241,32 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Kutip argumen argv Windows: backslash sebelum tanda kutip (juga sebelum
+/// tanda kutip penutup) digandakan, tanda kutip itu sendiri di-escape.
+fn quote_arg(a: &str) -> String {
+    let mut out = String::with_capacity(a.len() + 2);
+    out.push('"');
+    let mut slashes = 0usize;
+    for c in a.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
 /// Jalankan ulang aplikasi lewat prompt UAC.
 pub fn relaunch_elevated(args: &[String]) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -1206,13 +1275,7 @@ pub fn relaunch_elevated(args: &[String]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let params = args
         .iter()
-        .map(|a| {
-            if a.contains(' ') {
-                format!("\"{a}\"")
-            } else {
-                a.clone()
-            }
-        })
+        .map(|a| quote_arg(a))
         .collect::<Vec<_>>()
         .join(" ");
 

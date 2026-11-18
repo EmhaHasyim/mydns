@@ -39,6 +39,8 @@ const PROBE_HOST_V6: &str = "2606:4700:4700::1111";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Batas waktu menunggu task pembaca paket berhenti saat tunnel dimatikan.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// Batas respons `/cdn-cgi/trace`; jawaban normal hanya ratusan byte.
+const MAX_TRACE_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 pub struct Stats {
@@ -147,7 +149,7 @@ impl Vpn {
             }
         };
 
-        debug_dump("setelah rute dipasang", index, &routes);
+        debug_dump("setelah rute dipasang", index, &routes).await;
         // Rute baru belum langsung dipakai stack: tunggu sampai Windows sendiri
         // memilih adapter ini untuk alamat tujuan, baru trafik diuji. Tanpa
         // langkah ini probe bisa gagal dengan "unreachable host" walau
@@ -293,10 +295,19 @@ pub async fn exit_ip() -> Result<String, String> {
         .map_err(|e| format!("gagal mengirim permintaan trace: {e}"))?;
 
     let mut raw = Vec::new();
-    tokio::time::timeout(Duration::from_secs(6), tls.read_to_end(&mut raw))
-        .await
-        .map_err(|_| "timeout menunggu trace".to_string())?
-        .map_err(|e| format!("gagal membaca trace: {e}"))?;
+    // Baca satu byte lebih dari batas supaya respons kepanjangan terdeteksi.
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        (&mut tls)
+            .take(MAX_TRACE_BYTES as u64 + 1)
+            .read_to_end(&mut raw),
+    )
+    .await
+    .map_err(|_| "timeout menunggu trace".to_string())?
+    .map_err(|e| format!("gagal membaca trace: {e}"))?;
+    if raw.len() > MAX_TRACE_BYTES {
+        return Err("respons trace melebihi batas".to_string());
+    }
 
     let text = String::from_utf8_lossy(&raw);
     text.lines()
@@ -426,7 +437,10 @@ async fn wait_route_active(index: u32, host: &str) {
         let script = format!(
             "$r = Find-NetRoute -RemoteIPAddress {host} -ErrorAction SilentlyContinue | Select-Object -First 1; if ($r) {{ \"$($r.InterfaceIndex)\" }} else {{ '0' }}"
         );
-        if let Ok(text) = win::run_ps(&script)
+        // `run_ps` mem-block: jalankan di thread blocking supaya worker Tokio
+        // tidak macet selama PowerShell hidup.
+        let result = tokio::task::spawn_blocking(move || win::run_ps(&script)).await;
+        if let Ok(Ok(text)) = result
             && text.trim().parse::<u32>() == Ok(index)
         {
             return;
@@ -436,7 +450,7 @@ async fn wait_route_active(index: u32, host: &str) {
 }
 
 /// Diagnostik untuk mengurai kegagalan rute di mesin nyata (`MYDNS_VPN_DEBUG=1`).
-fn debug_dump(label: &str, index: u32, routes: &win::SavedVpn) {
+async fn debug_dump(label: &str, index: u32, routes: &win::SavedVpn) {
     if std::env::var("MYDNS_VPN_DEBUG").is_err() {
         return;
     }
@@ -453,8 +467,10 @@ Get-NetIPAddress -InterfaceIndex {index} | Select-Object IPAddress,PrefixLength 
 Get-NetRoute -InterfaceIndex {index} | Select-Object DestinationPrefix,NextHop,RouteMetric | Format-Table
 Get-NetIPInterface -InterfaceIndex {index} | Select-Object NlMtu,InterfaceMetric,ConnectionState | Format-Table"
     );
-    match win::run_ps(&script) {
-        Ok(text) => println!("{text}"),
+    // Sama seperti `wait_route_active`: PowerShell dipindah ke thread blocking.
+    match tokio::task::spawn_blocking(move || win::run_ps(&script)).await {
+        Ok(Ok(text)) => println!("{text}"),
+        Ok(Err(e)) => println!("diagnostik gagal: {e}"),
         Err(e) => println!("diagnostik gagal: {e}"),
     }
 }
@@ -517,6 +533,7 @@ fn load_wintun() -> Result<Wintun, String> {
         if !path.exists() {
             continue;
         }
+        // shortcut: hash diverifikasi dari path lalu path dibuka ulang (TOCTOU); upgrade: verifikasi handle yang sudah terbuka / muat dari folder non-user-writable.
         verify_wintun(&path)?;
         return unsafe { wintun::load_from_path(&path) }
             .map_err(|e| format!("gagal memuat {}: {e}", path.display()));

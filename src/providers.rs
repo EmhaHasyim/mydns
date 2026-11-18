@@ -246,6 +246,11 @@ fn parse_line(line: &str) -> Result<Entry, String> {
                 }
                 None => (value, 853),
             };
+            // IPv6 dalam tanda kurung: SNI hanya menerima alamat tanpa `[]`.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or(host);
             if host.is_empty() {
                 return Err("host DoQ kosong".to_string());
             }
@@ -256,7 +261,24 @@ fn parse_line(line: &str) -> Result<Entry, String> {
     let doh_field = parts.next().unwrap_or("");
     let doh = match doh_field {
         "" | "-" => None,
-        value if value.starts_with("https://") => Some(value.to_string()),
+        value if value.starts_with("https://") => {
+            // Host wajib ada: `https://` saja bukan endpoint yang bisa dipakai.
+            let authority = value["https://".len()..]
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .rsplit('@')
+                .next()
+                .unwrap_or("");
+            let host = match authority.strip_prefix('[') {
+                Some(rest) => rest.split(']').next().unwrap_or(""),
+                None => authority.split(':').next().unwrap_or(""),
+            };
+            if host.is_empty() {
+                return Err(format!("host DoH kosong ({value})"));
+            }
+            Some(value.to_string())
+        }
         value => return Err(format!("URL DoH harus dimulai https:// ({value})")),
     };
 
@@ -394,6 +416,19 @@ mod tests {
         assert_eq!(config.entries.len(), 1);
         assert_eq!(config.entries[0].doq, Some(("dns.x".to_string(), 8853)));
         assert!(config.entries[0].doh.is_none());
+    }
+
+    #[test]
+    fn host_doh_kosong_dan_ipv6_doq() {
+        let config = parse("k | N | c | - | https:// | 1.2.3.4");
+        assert!(
+            config.errors.iter().any(|e| e.contains("host DoH kosong")),
+            "{:?}",
+            config.errors
+        );
+        let config = parse("k | N | c | [::1]:853 | - | 1.2.3.4");
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(config.entries[0].doq, Some(("::1".to_string(), 853)));
     }
 
     #[test]
