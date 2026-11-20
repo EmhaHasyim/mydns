@@ -635,6 +635,9 @@ impl Engine {
         for _ in 0..rounds.max(1) {
             let started = Instant::now();
             let resp = self.query_proto(proto, query).await?;
+            if !response_matches(query, &resp) {
+                return Err("jawaban tidak cocok dengan query".to_string());
+            }
             best = best.min(started.elapsed().as_millis());
             summary = describe(&resp);
         }

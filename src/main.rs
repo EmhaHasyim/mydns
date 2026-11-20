@@ -12,6 +12,7 @@ mod win;
 
 use crate::log::Log;
 use crate::providers::{config_path, providers as resolver_list, read_config};
+use crate::win::{ProcessIdentity, parse_process_identity};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,9 +33,10 @@ fn main() {
     // Pendamping pemulihan (lihat win::spawn_watchdog). Tidak pernah
     // mengubah apa pun selama induknya masih hidup.
     if let Some(pos) = args.iter().position(|a| a == "--watchdog")
-        && let Some(pid) = args.get(pos + 1).and_then(|p| p.parse::<u32>().ok())
+        && let Some(ProcessIdentity { pid, start_time }) =
+            args.get(pos + 1).and_then(|p| parse_process_identity(p))
     {
-        cmd_watchdog(pid);
+        cmd_watchdog(pid, start_time);
         return;
     }
 
@@ -213,11 +215,11 @@ fn cmd_restore(args: &[String]) {
 
 /// Dipanggil anak pendamping: tunggu induk selesai, lalu bersihkan kalau induk
 /// tidak sempat melakukannya sendiri.
-fn cmd_watchdog(pid: u32) {
+fn cmd_watchdog(pid: u32, start_time: u64) {
     // `wait_for_process` menunggu sampai induk benar-benar pergi. Kalau induk
     // sudah hilang saat dibuka, ia mengembalikan false — tapi pemulihan tetap
     // wajib dijalankan (restore_if_stale aman dan idempoten).
-    let _ = win::wait_for_process(pid);
+    let _ = win::wait_for_process(pid, start_time);
     // Urutan sama dengan pemulihan manual: rute VPN dulu, baru DNS.
     let _ = vpn::down_if_stale();
     let _ = win::restore_if_stale();
@@ -628,7 +630,18 @@ fn cmd_control(command: &str) {
 /// proses ini hidup, dan rutenya dicabut saat keluar.
 fn cmd_vpn(args: &[String], mode: &str, dns_provider: Option<&str>) {
     match mode {
-        "status" => println!("VPN: {}", vpn::status()),
+        "status" => {
+            println!("VPN: {}", vpn::status());
+            // Lokasi egress hanya bisa dibaca lewat jaringan, jadi hanya
+            // ditanyakan kalau tunnel memang tercatat aktif.
+            if win::vpn_saved().is_some() {
+                let rt = runtime();
+                match rt.block_on(vpn::exit_info()) {
+                    Ok(info) => println!("IP keluar: {}", info.label()),
+                    Err(e) => println!("IP keluar: tidak terbaca ({e})"),
+                }
+            }
+        }
         "off" | "matikan" => {
             need_admin(args);
             let rt = runtime();
@@ -650,7 +663,7 @@ fn cmd_vpn(args: &[String], mode: &str, dns_provider: Option<&str>) {
             win::spawn_watchdog();
             let rt = runtime();
             let outcome: Result<(), String> = rt.block_on(async {
-                let before = vpn::exit_ip().await.unwrap_or_else(|_| "-".to_string());
+                let before = vpn::exit_info().await.ok();
                 let tunnel = vpn::Vpn::up().await?;
                 let families = if tunnel.routes().ipv6.is_empty() {
                     "IPv4"
@@ -662,8 +675,14 @@ fn cmd_vpn(args: &[String], mode: &str, dns_provider: Option<&str>) {
                     tunnel.mtu,
                     tunnel.routes().routes.len()
                 );
-                match vpn::exit_ip().await {
-                    Ok(after) => println!("IP keluar: {before} → {after}"),
+                let before = before.map(|info| info.label()).unwrap_or_default();
+                let before = if before.is_empty() {
+                    "-"
+                } else {
+                    before.as_str()
+                };
+                match vpn::exit_info().await {
+                    Ok(after) => println!("IP keluar: {before} → {}", after.label()),
                     Err(e) => println!("IP keluar: {before} → tidak terbaca ({e})"),
                 }
                 println!("Tekan Ctrl+C untuk mematikan.\n");
@@ -691,18 +710,26 @@ fn cmd_vpn(args: &[String], mode: &str, dns_provider: Option<&str>) {
             let rt = runtime();
             let outcome: Result<(), String> = rt.block_on(async {
                 let started = Instant::now();
-                let before = vpn::exit_ip().await.unwrap_or_else(|_| "-".to_string());
+                let before = vpn::exit_info().await.ok();
                 let tunnel = vpn::Vpn::up().await?;
                 println!(
                     "tunnel siap dan trafik terverifikasi dalam {} ms (MTU {})",
                     started.elapsed().as_millis(),
                     tunnel.mtu
                 );
-                match vpn::exit_ip().await {
-                    Ok(after) if after == before => println!(
-                        "IP keluar: {before} → {after} (TIDAK berubah — tunnel belum dipakai)"
+                let before_ip = before.as_ref().map(|info| info.ip.clone());
+                let before = before.map(|info| info.label()).unwrap_or_default();
+                let before = if before.is_empty() {
+                    "-"
+                } else {
+                    before.as_str()
+                };
+                match vpn::exit_info().await {
+                    Ok(after) if Some(&after.ip) == before_ip.as_ref() => println!(
+                        "IP keluar: {before} → {} (TIDAK berubah — tunnel belum dipakai)",
+                        after.label()
                     ),
-                    Ok(after) => println!("IP keluar: {before} → {after}"),
+                    Ok(after) => println!("IP keluar: {before} → {}", after.label()),
                     Err(e) => println!("IP keluar: {before} → tidak terbaca ({e})"),
                 }
                 // Bukti tambahan: resolver pilihan pengguna tetap dipakai walau
@@ -731,6 +758,9 @@ fn cmd_vpn(args: &[String], mode: &str, dns_provider: Option<&str>) {
                 Ok(())
             });
             if let Err(e) = outcome {
+                // Sama seperti cabang `on`: rute yang sudah terpasang tetap
+                // dicabut walau kegagalan terjadi setelah Vpn::up().
+                let _ = rt.block_on(tokio::task::spawn_blocking(vpn::down_persisted));
                 eprintln!("gagal: {e}");
                 std::process::exit(1);
             }

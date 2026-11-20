@@ -41,6 +41,8 @@ fn create_pipe_named(first: bool, name: &str) -> std::io::Result<NamedPipeServer
     let mut options = ServerOptions::new();
     options.first_pipe_instance(first);
 
+    // D:P menghapus ACE warisan Everyone; label integritas object mengikuti
+    // token pembuat, jadi proses low-integrity tidak bisa menulis ke pipe ini.
     const SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
     let sddl: Vec<u16> = SDDL.encode_utf16().chain(std::iter::once(0)).collect();
     let mut sd: *mut c_void = std::ptr::null_mut();

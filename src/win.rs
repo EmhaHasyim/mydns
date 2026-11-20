@@ -608,11 +608,26 @@ pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String>
     save_state(&saved)?;
 
     let script = apply_script(&adapters, listen_v6);
-    let raw = run_ps(&script)?;
+    let raw = match run_ps(&script) {
+        Ok(raw) => raw,
+        Err(e) => {
+            // PowerShell bisa gagal setelah mengubah sebagian adapter. Pakai
+            // catatan yang baru disimpan untuk memutar perubahan itu kembali.
+            let rollback = restore_plan(Some(&saved), &adapters);
+            if rollback.1 > 0 {
+                let _ = run_ps(&rollback.0);
+            }
+            return Err(e);
+        }
+    };
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
     let ok_count = json_count(parsed.get("ok"));
     let bad_count = json_count(parsed.get("bad"));
     if ok_count != adapters.len() || bad_count > 0 {
+        let rollback = restore_plan(Some(&saved), &adapters);
+        if rollback.1 > 0 {
+            let _ = run_ps(&rollback.0);
+        }
         return Err(format!(
             "gagal mengubah DNS pada {} adapter (berhasil {}, gagal {}): {raw}",
             adapters.len(),
@@ -620,7 +635,13 @@ pub fn apply(provider_id: &str, listen_v6: bool) -> Result<Vec<Adapter>, String>
             bad_count
         ));
     }
-    verify_applied(&adapters, listen_v6)?;
+    if let Err(e) = verify_applied(&adapters, listen_v6) {
+        let rollback = restore_plan(Some(&saved), &adapters);
+        if rollback.1 > 0 {
+            let _ = run_ps(&rollback.0);
+        }
+        return Err(e);
+    }
 
     flush_dns();
     Ok(adapters)
@@ -725,7 +746,7 @@ pub fn restore() -> Result<String, String> {
         // tetap disimpan: menghapusnya akan menghilangkan satu-satunya catatan
         // DNS asli. Hanya hapus kalau memang tidak ada state sejak awal.
         if saved.is_some() {
-            return Ok("Restore gagal: tidak ada adapter yang cocok ditemukan".to_string());
+            return Err("Restore gagal: tidak ada adapter yang cocok ditemukan".to_string());
         }
         clear_state();
         return Ok(
@@ -733,16 +754,34 @@ pub fn restore() -> Result<String, String> {
         );
     }
 
+    let targets = script_indices(&script);
     run_ps(&script)?;
     flush_dns();
     // Jangan hapus state kalau verifikasi gagal: ini satu-satunya catatan
     // untuk mencoba lagi.
-    verify_restored()?;
+    verify_restored(&targets)?;
     clear_state();
     Ok(format!("DNS dipulihkan pada {touched} adapter"))
 }
 
-fn verify_restored() -> Result<(), String> {
+/// Index yang benar-benar disentuh skrip restore — hanya ini yang boleh
+/// diverifikasi, supaya adapter lain yang kebetulan memakai loopback tidak
+/// membuat restore gagal palsu.
+fn script_indices(script: &str) -> Vec<u32> {
+    const KEY: &str = "-InterfaceIndex ";
+    script
+        .match_indices(KEY)
+        .filter_map(|(at, _)| {
+            script[at + KEY.len()..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+fn verify_restored(targets: &[u32]) -> Result<(), String> {
     // Sama seperti verify_applied: tulisan PowerShell butuh waktu sebelum
     // terbaca lewat GetAdaptersAddresses. Coba beberapa kali sebelum gagal.
     let mut last = String::new();
@@ -750,7 +789,9 @@ fn verify_restored() -> Result<(), String> {
         match list_adapters() {
             Ok(adapters) => {
                 if let Some(stuck) = adapters.iter().find(|a| {
-                    a.v4.iter().any(|s| s == "127.0.0.1") || a.v6.iter().any(|s| s == "::1")
+                    targets.contains(&a.index)
+                        && (a.v4.iter().any(|s| s == "127.0.0.1")
+                            || a.v6.iter().any(|s| s == "::1"))
                 }) {
                     last = format!(
                         "DNS adapter {} masih menunjuk loopback setelah restore",
@@ -977,16 +1018,17 @@ pub fn vpn_install_routes(
     script.push_str("'ok'\n");
 
     if let Err(e) = run_ps(&script) {
-        vpn_remove_routes(&saved);
+        let _ = vpn_remove_routes(&saved);
         vpn_clear_state();
         return Err(format!("gagal memasang rute VPN: {e}"));
     }
     Ok(saved)
 }
 
-/// Cabut rute yang pernah dipasang. Kegagalan diabaikan: yang penting sisa
-/// rute dicoba dibersihkan semua, bukan berhenti di rute pertama yang hilang.
-pub fn vpn_remove_routes(saved: &SavedVpn) {
+/// Cabut rute yang pernah dipasang. Semua rute tetap dicoba walau ada yang
+/// gagal, lalu kegagalan dikembalikan supaya state tidak dihapus: state adalah
+/// satu-satunya catatan untuk mencoba lagi.
+pub fn vpn_remove_routes(saved: &SavedVpn) -> Result<(), String> {
     let mut script = String::new();
     for route in &saved.routes {
         script.push_str(&format!(
@@ -995,7 +1037,7 @@ pub fn vpn_remove_routes(saved: &SavedVpn) {
             route.iface
         ));
     }
-    let _ = run_ps(&script);
+    run_ps(&script).map(|_| ())
 }
 
 pub fn vpn_saved() -> Option<SavedVpn> {
@@ -1015,9 +1057,64 @@ pub fn vpn_clear_state() {
     }
 }
 
-/// Tunggu proses lain benar-benar selesai. `false` kalau prosesnya sudah tidak
-/// ada saat hendak dibuka.
-pub fn wait_for_process(pid: u32) -> bool {
+/// Identitas proses induk yang dikirim ke watchdog: PID saja tidak cukup
+/// karena PID bisa dipakai ulang setelah induk keluar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+}
+
+pub fn process_identity() -> ProcessIdentity {
+    ProcessIdentity {
+        pid: std::process::id(),
+        start_time: process_start_time().unwrap_or(0),
+    }
+}
+
+/// `pid:start_time`, format yang stabil untuk argumen baris perintah.
+pub fn format_process_identity(identity: ProcessIdentity) -> String {
+    format!("{}:{}", identity.pid, identity.start_time)
+}
+
+pub fn parse_process_identity(text: &str) -> Option<ProcessIdentity> {
+    let (pid, start_time) = text.split_once(':')?;
+    Some(ProcessIdentity {
+        pid: pid.parse().ok()?,
+        start_time: start_time.parse().ok()?,
+    })
+}
+
+fn process_start_time() -> Option<u64> {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut creation = FILETIME_ZERO;
+    let mut exit = FILETIME_ZERO;
+    let mut kernel = FILETIME_ZERO;
+    let mut user = FILETIME_ZERO;
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
+const FILETIME_ZERO: windows_sys::Win32::Foundation::FILETIME =
+    windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+
+/// Tunggu sampai proses dengan identitas itu benar-benar pergi. Kalau PID
+/// dipakai ulang, waktu mulai tidak cocok dan dianggap sudah pergi.
+pub fn wait_for_process(pid: u32, start_time: u64) -> bool {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GetLastError, WAIT_OBJECT_0,
     };
@@ -1032,14 +1129,15 @@ pub fn wait_for_process(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
         if handle.is_null() {
-            // Bedakan induk yang memang sudah tidak ada dari kegagalan akses.
-            // Kalau tidak bisa dipastikan, anggap sudah pergi dan biarkan
-            // watchdog tetap mencoba restore (restore_if_stale aman dipanggil).
             let err = GetLastError();
-            if err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_FOUND {
-                return false;
-            }
-            return true;
+            return err != ERROR_INVALID_PARAMETER && err != ERROR_NOT_FOUND;
+        }
+        if start_time != 0
+            && let Some(found) = process_start_time_for(handle)
+            && found != start_time
+        {
+            CloseHandle(handle);
+            return false;
         }
         let code = WaitForSingleObject(handle, INFINITE);
         CloseHandle(handle);
@@ -1047,20 +1145,29 @@ pub fn wait_for_process(pid: u32) -> bool {
     }
 }
 
+fn process_start_time_for(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let mut creation = FILETIME_ZERO;
+    let mut exit = FILETIME_ZERO;
+    let mut kernel = FILETIME_ZERO;
+    let mut user = FILETIME_ZERO;
+    if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
 /// Jalankan pendamping kecil yang memulihkan DNS kalau proses induk mati tanpa
 /// sempat membersihkan (Task Manager, crash, listrik putus). Proses ini tidak
 /// pernah memunculkan jendela dan tidak pernah mengubah apa pun selama induk
 /// masih hidup.
 pub fn spawn_watchdog() {
-    // shortcut: pendamping menunggu PID mentah; kalau PID dipakai ulang sebelum
-    // OpenProcess, ia bisa menunggu proses yang salah. Upgrade: teruskan handle
-    // induk yang sudah diduplikasi (atau waktu mulai proses) lewat argumen.
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let _ = Command::new(exe)
         .arg("--watchdog")
-        .arg(std::process::id().to_string())
+        .arg(format_process_identity(process_identity()))
         .creation_flags(DETACHED_PROCESS)
         .spawn();
 }
@@ -1555,6 +1662,25 @@ mod tests {
 
         assert_eq!(touched, 0);
         assert!(!script.contains("-InterfaceIndex"), "{script}");
+    }
+
+    #[test]
+    fn indeks_skrip_restore_hanya_yang_disentuh() {
+        let script = "Set-DnsClientServerAddress -InterfaceIndex 12 -ServerAddresses '1.1.1.1'\nSet-DnsClientServerAddress -InterfaceIndex 7 -ResetServerAddresses\n'ok'\n";
+        assert_eq!(script_indices(script), vec![12, 7]);
+    }
+
+    #[test]
+    fn identitas_proses_tahan_satu_putaran_parse() {
+        let identity = ProcessIdentity {
+            pid: 1234,
+            start_time: u64::MAX,
+        };
+        assert_eq!(
+            parse_process_identity(&format_process_identity(identity)),
+            Some(identity)
+        );
+        assert_eq!(parse_process_identity("12:tidak-angka"), None);
     }
 
     #[test]

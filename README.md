@@ -3,7 +3,8 @@
 Ganti DNS Windows 11 ke **DoQ / DoH3** (DNS lewat QUIC) supaya lebih cepat dan
 lebih privat. Windows belum bisa memakai dua protokol ini.
 
-MyDNS hanya satu file `.exe`, tidak perlu install, tidak menyisakan layanan.
+MyDNS satu file `.exe` (mode VPN juga butuh `wintun.dll` di folder yang sama),
+tidak perlu install, tidak menyisakan layanan.
 
 ## Cara pakai
 
@@ -59,6 +60,12 @@ mydns autostart on  # pulihkan DNS otomatis saat komputer nyala
 - Port 53 harus kosong (jangan bentrok dengan Docker atau AdGuard Home).
 - Mode VPN butuh hak admin dan file `wintun.dll` yang disertakan.
 - DNS aktif selama program berjalan.
+
+Variabel lingkungan opsional:
+
+- `MYDNS_RESOLVERS` — path ke berkas konfigurasi resolver kustom.
+- `MYDNS_WARP` — path ke berkas konfigurasi WARP (`warp.json`).
+- `MYDNS_NO_ELEVATE` — lewati permintaan UAC (DNS tidak akan diubah).
 
 ## Untuk pengembang
 

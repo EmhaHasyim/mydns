@@ -63,7 +63,7 @@ const HELP_HEIGHT: u16 = 13;
 
 const HELP_KEYS: [(&str, &str); 8] = [
     ("↑ ↓ / j k", "pindah pilihan"),
-    ("1 – 9", "lompat ke baris"),
+    ("0 – 9", "lompat ke baris (dua digit + enter)"),
     ("enter", "terapkan resolver (DNS saja)"),
     ("v", "VPN: seluruh trafik lewat WARP"),
     ("c", "Clear DNS (pulihkan)"),
@@ -167,6 +167,11 @@ pub struct App {
     tick: u64,
     /// Pilihan biner yang diminta pengguna: dengan VPN, atau DNS saja.
     vpn: bool,
+    /// Apakah keadaan DNS saat ini benar-benar sudah dipulihkan, supaya
+    /// kegagalan di jalur lain tidak mengklaim sebaliknya.
+    dns_restored: bool,
+    /// Digit pertama dari shortcut angka dua digit (0 = 10).
+    shortcut_index: Option<usize>,
     /// IP keluar lewat tunnel, ditampilkan di header selama VPN menyala.
     exit_ip: Option<String>,
     /// Identitas perangkat WARP, di-cache supaya panel detail tidak membaca
@@ -183,6 +188,7 @@ fn item_count() -> usize {
 
 impl App {
     fn on_key(&mut self, key: KeyEvent) {
+        self.shortcut_index = None;
         // Di raw mode Ctrl+C datang sebagai key event, bukan sinyal.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if key.code == KeyCode::Char('c') {
@@ -193,20 +199,16 @@ impl App {
 
         if self.show_help {
             // Saat bantuan terbuka, tutup dulu sebelum aksi lain.
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Char('x') => self.quit = true,
-                _ => self.show_help = false,
-            }
+            self.show_help = false;
             return;
         }
 
         if self.show_log {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Char('x') => self.quit = true,
-                _ => self.show_log = false,
-            }
+            self.show_log = false;
             return;
         }
+        // Status lama bukan bukti DNS sudah dipulihkan.
+        self.dns_restored = false;
 
         match key.code {
             // Keluar selalu memulihkan DNS (lihat blok cleanup di `run`).
@@ -221,15 +223,32 @@ impl App {
             }
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = item_count() - 1,
-            KeyCode::Enter => self.activate(),
             KeyCode::Char('v') => self.toggle_vpn(),
             KeyCode::Char('c') => self.clear_dns(),
-            KeyCode::Char(d @ '1'..='9') => {
-                // Angka 1–9 langsung menuju baris, tanpa menerapkan apa pun.
-                let index = d as usize - '0' as usize;
-                if (1..=item_count()).contains(&index) {
-                    self.cursor = index - 1;
+            KeyCode::Char(d @ '0'..='9') => {
+                let index = d.to_digit(10).unwrap() as usize;
+                if let Some(first) = self.shortcut_index.take() {
+                    // Dua digit berturut-turut memilih baris 10–99.
+                    let target = first * 10 + index;
+                    if target > 0 && target <= item_count() {
+                        self.cursor = target - 1;
+                    }
+                } else {
+                    self.shortcut_index = Some(index);
+                    if index > 0 && index <= item_count() {
+                        self.cursor = index - 1;
+                    }
                 }
+            }
+            KeyCode::Enter => {
+                if let Some(index) = self.shortcut_index.take() {
+                    // Tombol 0 dipakai untuk baris ke-10.
+                    let target = if index == 0 { 10 } else { index };
+                    if target <= item_count() {
+                        self.cursor = target - 1;
+                    }
+                }
+                self.activate();
             }
             _ => {}
         }
@@ -280,8 +299,21 @@ impl App {
         }
         if self.vpn {
             self.vpn = false;
-            self.clear_dns();
-            self.status = "VPN dimatikan · tekan enter untuk DNS saja".to_string();
+            let index = if self.cursor < providers().len() {
+                self.cursor
+            } else {
+                self.active.as_ref().map(|a| a.index).unwrap_or(0)
+            };
+            if self.begin(format!(
+                "mematikan VPN — DNS {} tetap aktif…",
+                providers()[index].name
+            )) {
+                let rt = self.rt.clone();
+                let tx = self.tx.clone();
+                let session = self.session.clone();
+                let log = self.log.clone();
+                rt.spawn(async move { apply_flow(index, false, session, log, tx).await });
+            }
             return;
         }
 
@@ -365,6 +397,7 @@ impl App {
                     if self.vpn { " + VPN" } else { "" },
                     ms
                 );
+                self.dns_restored = false;
                 self.dns_now = if self.vpn {
                     // Ringkas: baris ini berbagi ruang dengan badge kanan.
                     format!(
@@ -397,6 +430,7 @@ impl App {
                 self.vpn = false;
                 self.hits = 0;
                 self.misses = 0;
+                self.dns_restored = true;
                 self.dns_now = "setelan DNS asli dipulihkan".to_string();
                 crate::log::event(&format!("restore: {text}"));
                 self.status = text;
@@ -409,7 +443,9 @@ impl App {
                 // header mengaku VPN menyala.
                 self.vpn = false;
                 self.exit_ip = None;
-                self.dns_now = "setelan DNS asli dipulihkan".to_string();
+                if self.dns_restored {
+                    self.dns_now = "setelan DNS asli dipulihkan".to_string();
+                }
                 crate::log::event(&format!("gagal: {error}"));
                 self.status = error;
             }
@@ -417,7 +453,10 @@ impl App {
                 self.hits = hits;
                 self.misses = misses;
             }
-            Msg::Status(summary) => self.dns_now = format_status(&summary),
+            Msg::Status(summary) => {
+                self.dns_now = format_status(&summary);
+                self.dns_restored = false;
+            }
             Msg::WarpDevice(device) => self.warp_device = device,
         }
     }
@@ -1224,9 +1263,16 @@ async fn apply_flow(
                         Ok(Ok(_)) => {
                             last_failure = None;
                             watch_log.push("adapter dikembalikan ke proxy setelah jaringan berubah");
-                            let _ = drift_tx.send(Msg::Working(
-                                "jaringan berubah — DNS adapter dikembalikan ke proxy".to_string(),
-                            ));
+                            let adapters = win::list_adapters()
+                                .map(|list| list.len())
+                                .unwrap_or(0);
+                            let _ = drift_tx.send(Msg::Applied {
+                                index,
+                                proto,
+                                ms,
+                                adapters,
+                                exit_ip: None,
+                            });
                         }
                         _ => last_failure = Some(Instant::now()),
                     }
@@ -1268,7 +1314,10 @@ async fn apply_flow(
     // Ukur IP keluar lewat tunnel: satu-satunya bukti yang berarti bagi
     // pengguna bahwa VPN benar-benar mengubah jalur, bukan hanya rute.
     let exit_ip = if vpn_running {
-        crate::vpn::exit_ip().await.ok()
+        crate::vpn::exit_info()
+            .await
+            .ok()
+            .map(|info| info.ip.clone())
     } else {
         None
     };
@@ -1314,6 +1363,8 @@ pub fn run(
         misses: 0,
         tick: 0,
         vpn: false,
+        dns_restored: false,
+        shortcut_index: None,
         exit_ip: None,
         warp_device: None,
         latencies: vec![Vec::new(); providers().len()],
@@ -1389,9 +1440,7 @@ pub fn run(
         stop_session(&session).await;
         // Sisa rute dari sesi lama (mis. setelah crash) juga dicabut di sini.
         let _ = tokio::task::spawn_blocking(crate::vpn::down_persisted).await;
-        if win::load_state().is_some() {
-            let _ = tokio::task::spawn_blocking(win::restore).await;
-        }
+        let _ = tokio::task::spawn_blocking(win::restore).await;
     });
 
     outcome
@@ -1431,6 +1480,8 @@ mod tests {
             misses: 0,
             tick: 0,
             vpn: false,
+            dns_restored: false,
+            shortcut_index: None,
             exit_ip: None,
             warp_device: None,
             latencies: vec![Vec::new(); providers().len()],
@@ -1516,6 +1567,16 @@ mod tests {
         // IP keluar tidak boleh hilang walau baris DNS panjang.
         let header = &lines[1];
         assert!(header.contains("104.28.215.130"), "header: {header}");
+    }
+
+    #[test]
+    fn shortcut_digit_pertama_lompat_ke_baris() {
+        let mut app = app();
+        app.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.cursor, 1);
+        // Digit kedua tidak merusak pilihan kalau tidak ada entri ke-20.
+        app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(app.cursor, 1);
     }
 
     #[test]

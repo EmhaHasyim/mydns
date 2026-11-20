@@ -99,6 +99,9 @@ pub struct Proxy {
     inflight: Mutex<HashMap<Key, Weak<Mutex<()>>>>,
     /// Pembatas koneksi TCP aktif, dipakai bersama oleh listener v4 dan v6.
     tcp_permits: Arc<Semaphore>,
+    /// Pembatas query UDP aktif: satu datagram satu task, tanpa ini burst bisa
+    /// membuat ratusan ribu task dan permintaan keluar bersamaan.
+    udp_permits: Arc<Semaphore>,
     hits: AtomicU64,
     misses: AtomicU64,
     forwards: AtomicU64,
@@ -112,6 +115,7 @@ impl Proxy {
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             tcp_permits: Arc::new(Semaphore::new(MAX_TCP_CONNS)),
+            udp_permits: Arc::new(Semaphore::new(MAX_TCP_CONNS)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             forwards: AtomicU64::new(0),
@@ -526,7 +530,13 @@ async fn udp_loop(sock: Arc<UdpSocket>, proxy: Arc<Proxy>, mut stop: watch::Rece
                 let request = buf[..n].to_vec();
                 let proxy = proxy.clone();
                 let sock = sock.clone();
+                // Sama seperti TCP: penuh = buang datagram (DNS client akan
+                // mengirim ulang), daripada menumpuk task tanpa batas.
+                let Ok(permit) = Arc::clone(&proxy.udp_permits).try_acquire_owned() else {
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Some(response) = proxy.handle(&request, false).await {
                         let _ = sock.send_to(&response, peer).await;
                     }

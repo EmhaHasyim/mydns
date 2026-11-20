@@ -1,6 +1,6 @@
 @echo off
 rem Jalankan MyDNS dari folder proyek ini.
-rem Tambahkan folder ini ke PATH supaya cukup mengetik: dns
+rem Tambahkan folder ini ke PATH supaya cukup mengetik: mydns
 setlocal
 set "BIN=%~dp0mydns.exe"
 if not exist "%BIN%" set "BIN=%~dp0target\release\mydns.exe"

@@ -229,7 +229,7 @@ impl Vpn {
         for task in self.tasks {
             let _ = tokio::time::timeout(SHUTDOWN_GRACE, task).await;
         }
-        win::vpn_remove_routes(&self.routes);
+        win::vpn_remove_routes(&self.routes)?;
         win::vpn_clear_state();
         delete_adapter(&self._wintun);
         Ok(format!(
@@ -250,7 +250,7 @@ pub fn down_persisted() -> Result<String, String> {
     }
     match saved {
         Some(saved) => {
-            win::vpn_remove_routes(&saved);
+            win::vpn_remove_routes(&saved)?;
             win::vpn_clear_state();
             Ok(format!(
                 "rute VPN dicabut ({} rute, adapter {})",
@@ -262,13 +262,38 @@ pub fn down_persisted() -> Result<String, String> {
     }
 }
 
-/// IP publik yang terlihat oleh internet saat ini. Dipakai untuk membuktikan
-/// tunnel benar-benar mengubah jalur keluar: kalau angkanya sama sebelum dan
-/// sesudah VPN, yang berubah hanya rute di tabel, bukan trafiknya.
+/// Hasil `/cdn-cgi/trace`: IP keluar yang dilihat internet, kode PoP Cloudflare
+/// yang melayani jalur itu (`colo`, mis. `SIN`), dan negara yang Cloudflare
+/// kaitkan dengan IP tersebut (`loc`, mis. `SG`).
+///
+/// `colo` dan `loc` penting karena WARP tidak punya pemilih lokasi: hanya angka
+/// ini yang bisa menjelaskan ke pengguna di mana trafiknya keluar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitInfo {
+    pub ip: String,
+    pub colo: String,
+    pub loc: String,
+}
+
+impl ExitInfo {
+    /// Satu baris untuk CLI dan panel status.
+    pub fn label(&self) -> String {
+        match (self.colo.is_empty(), self.loc.is_empty()) {
+            (true, true) => self.ip.clone(),
+            (false, true) => format!("{} · PoP {}", self.ip, self.colo),
+            (true, false) => format!("{} · {}", self.ip, self.loc),
+            (false, false) => format!("{} · PoP {} ({})", self.ip, self.colo, self.loc),
+        }
+    }
+}
+
+/// IP publik dan lokasi PoP yang terlihat oleh internet saat ini. Dipakai untuk
+/// membuktikan tunnel benar-benar mengubah jalur keluar: kalau IP-nya sama
+/// sebelum dan sesudah VPN, yang berubah hanya rute di tabel, bukan trafiknya.
 ///
 /// `https://1.1.1.1/cdn-cgi/trace` dipilih karena tidak butuh DNS (alamatnya
-/// literal) dan jawabannya satu baris `ip=...`.
-pub async fn exit_ip() -> Result<String, String> {
+/// literal) dan jawabannya baris `ip=...`, `colo=...`, `loc=...`.
+pub async fn exit_info() -> Result<ExitInfo, String> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut config = rustls::ClientConfig::builder()
@@ -310,17 +335,32 @@ pub async fn exit_ip() -> Result<String, String> {
     }
 
     let text = String::from_utf8_lossy(&raw);
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix("ip="))
-        .map(|ip| ip.trim().to_string())
-        .ok_or_else(|| "jawaban trace tidak memuat ip=".to_string())
+    let ip = trace_field(&text, "ip");
+    if ip.is_empty() {
+        return Err("jawaban trace tidak memuat ip=".to_string());
+    }
+    Ok(ExitInfo {
+        ip,
+        colo: trace_field(&text, "colo"),
+        loc: trace_field(&text, "loc"),
+    })
 }
 
-/// Versi aman untuk watchdog dan pemulihan saat logon: hanya membersihkan
-/// kalau catatan VPN ada **dan** tidak ada proxy yang sedang melayani port 53.
-/// Sesi yang masih hidup tidak boleh diganggu.
+/// Ambil nilai satu baris `kunci=nilai` dari respons trace. `colo`/`loc` bisa
+/// saja tidak dikirim (mis. jalur tanpa WARP), jadi hasil kosong bukan error.
+fn trace_field(text: &str, key: &str) -> String {
+    let prefix = format!("{key}=");
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Versi aman untuk watchdog dan pemulihan saat logon: rutevpn dicabut kalau
+/// catatan masih ada, terlepas dari siapa yang memakai port 53 — rute mati
+/// harus dibersihkan walau resolver lain sedang aktif.
 pub fn down_if_stale() -> Result<Option<String>, String> {
-    if win::vpn_saved().is_none() || !win::port53_free() {
+    if win::vpn_saved().is_none() {
         return Ok(None);
     }
     down_persisted().map(Some)
@@ -544,6 +584,31 @@ fn load_wintun() -> Result<Wintun, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_membaca_ip_colo_dan_loc() {
+        let raw = "HTTP/1.1 200 OK\r\nserver: cloudflare\r\n\r\nip=104.28.215.130\nloc=ID\ncolo=CGK\nwarp=on\n";
+        assert_eq!(trace_field(raw, "ip"), "104.28.215.130");
+        assert_eq!(trace_field(raw, "colo"), "CGK");
+        assert_eq!(trace_field(raw, "loc"), "ID");
+        assert_eq!(trace_field(raw, "warp"), "on");
+    }
+
+    #[test]
+    fn label_exit_info_menyertakan_pop_dan_negara() {
+        let full = ExitInfo {
+            ip: "104.28.215.130".to_string(),
+            colo: "SIN".to_string(),
+            loc: "SG".to_string(),
+        };
+        assert_eq!(full.label(), "104.28.215.130 · PoP SIN (SG)");
+        let ip_only = ExitInfo {
+            ip: "104.28.215.130".to_string(),
+            colo: String::new(),
+            loc: String::new(),
+        };
+        assert_eq!(ip_only.label(), "104.28.215.130");
+    }
 
     #[test]
     fn alamat_ipv6_warp_menerima_prefiks() {

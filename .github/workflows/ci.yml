@@ -28,6 +28,17 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+      # Mode VPN memuat wintun.dll dari folder yang sama dengan executable.
+      - name: Bundle Wintun DLL
+        run: copy assets\wintun.dll target\release\wintun.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mydns-windows
+          path: |
+            target/release/mydns.exe
+            target/release/wintun.dll
+
   # Versi minimum di Cargo.toml harus benar-benar bisa membangun proyek.
   msrv:
     runs-on: windows-latest
