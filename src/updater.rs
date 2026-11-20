@@ -110,7 +110,9 @@ pub fn check_now() -> Result<String, String> {
         ));
     }
     let tag = tag_from_output(&stdout).ok_or("rilis GitHub belum tersedia")?;
-    save_cached(&tag, SystemTime::now())?;
+    // Cache hanya untuk pengingat: gagal tulis (misalnya fallback ProgramData
+    // tanpa izin) tidak boleh menggagalkan update yang sudah lolos pengecekan.
+    let _ = save_cached(&tag, SystemTime::now());
     Ok(tag)
 }
 

@@ -70,23 +70,34 @@ try {
         Expand-Archive -Path $zip -DestinationPath $extract -Force
 
         [void](New-Item -ItemType Directory -Path $BinDir -Force)
+        $exeDest = Join-Path $BinDir 'mydns.exe'
+        $oldExe = Join-Path $BinDir 'mydns.old.exe'
+        # Windows mengunci file .exe yang sedang jalan untuk overwrite, tapi
+        # membolehkan rename. Berganti nama dulu, lalu taruh biner baru.
+        if (Test-Path -LiteralPath $exeDest) {
+            if (Test-Path -LiteralPath $oldExe) { Remove-Item -LiteralPath $oldExe -Force }
+            Move-Item -LiteralPath $exeDest -Destination $oldExe -Force
+        }
         try {
-            Copy-Item -LiteralPath (Join-Path $extract 'mydns.exe') -Destination (Join-Path $BinDir 'mydns.exe') -Force
+            Copy-Item -LiteralPath (Join-Path $extract 'mydns.exe') -Destination $exeDest -Force
             Copy-Item -LiteralPath (Join-Path $extract 'wintun.dll') -Destination (Join-Path $BinDir 'wintun.dll') -Force
         } catch {
-            throw "gagal menimpa biner: $_`ntutup MyDNS dulu, lalu jalankan installer lagi."
+            if (Test-Path -LiteralPath $oldExe) { Move-Item -LiteralPath $oldExe -Destination $exeDest -Force }
+            throw "gagal menimpa biner: $_"
         }
+        if (Test-Path -LiteralPath $oldExe) { Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue }
 
-        # install.ps1 ikut disalin supaya `mydns update` berikutnya punya skrip.
+        # installer dari rilis dipakai supaya perbaikan installer ikut terpasang.
         $scriptDest = Join-Path $BinDir 'install.ps1'
-        $source = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
-        if ($source -and (Test-Path -LiteralPath $source)) {
-            if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($scriptDest)) {
+        try {
+            Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$tag/install.ps1" -OutFile $scriptDest -Headers @{ 'User-Agent' = 'mydns-installer' }
+        } catch {
+            $source = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+            if ($source -and (Test-Path -LiteralPath $source) -and ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($scriptDest))) {
                 Copy-Item -LiteralPath $source -Destination $scriptDest -Force
+            } elseif (-not (Test-Path -LiteralPath $scriptDest)) {
+                Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/master/install.ps1" -OutFile $scriptDest -Headers @{ 'User-Agent' = 'mydns-installer' }
             }
-        } else {
-            # Bootstrap lewat irm|iex: tiada berkas lokal, unduh dari master.
-            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/master/install.ps1" -OutFile $scriptDest -Headers @{ 'User-Agent' = 'mydns-installer' }
         }
 
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
