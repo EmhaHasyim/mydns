@@ -4,8 +4,13 @@
 #![allow(dead_code)]
 
 use serde::Deserialize;
+use serde_json::Value;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -63,6 +68,44 @@ pub fn save_cached(tag: &str, now: SystemTime) -> Result<(), String> {
     write_cached(&cache_path(), tag, now)
 }
 
+fn latest_from_json(body: &str) -> Option<String> {
+    let releases = serde_json::from_str::<Value>(body)
+        .ok()?
+        .as_array()?
+        .clone();
+    releases
+        .iter()
+        .filter_map(|r| r.get("tag_name")?.as_str())
+        .find(|tag| valid_tag(tag))
+        .map(str::to_string)
+}
+
+pub fn check_now() -> Result<String, String> {
+    let script = "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-RestMethod -Uri 'https://api.github.com/repos/EmhaHasyim/mydns/releases/latest' -Headers @{'User-Agent'='mydns-update'}).tag_name";
+    let out = Command::new(crate::win::system32_exe(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+    ))
+    .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    .creation_flags(CREATE_NO_WINDOW)
+    .output()
+    .map_err(|e| format!("tidak bisa mengecek rilis GitHub: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let detail = format!("{stdout} {stderr}");
+    if !out.status.success()
+        || detail.to_ascii_lowercase().contains("rate limit")
+        || detail.to_ascii_lowercase().contains("exception")
+    {
+        return Err(format!(
+            "tidak bisa mengecek rilis GitHub: {}",
+            detail.trim()
+        ));
+    }
+    let tag = latest_from_json(stdout.trim()).ok_or("rilis GitHub belum tersedia")?;
+    save_cached(&tag, SystemTime::now())?;
+    Ok(tag)
+}
+
 #[derive(Deserialize)]
 struct CacheEntry {
     checked_at: u64,
@@ -101,6 +144,18 @@ fn unix_secs(now: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_terbaru_diambil_dari_json() {
+        assert_eq!(
+            latest_from_json(r#"[{"tag_name":"v0.2.0"},{"tag_name":"v0.1.0"}]"#).as_deref(),
+            Some("v0.2.0")
+        );
+        assert_eq!(
+            latest_from_json(r#"{"message":"API rate limit exceeded"}"#).as_deref(),
+            None
+        );
+    }
 
     #[test]
     fn membandingkan_versi_dan_tag() {
