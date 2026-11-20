@@ -75,7 +75,7 @@ try {
         # Windows mengunci file .exe yang sedang jalan untuk overwrite, tapi
         # membolehkan rename. Berganti nama dulu, lalu taruh biner baru.
         if (Test-Path -LiteralPath $exeDest) {
-            if (Test-Path -LiteralPath $oldExe) { Remove-Item -LiteralPath $oldExe -Force }
+            if (Test-Path -LiteralPath $oldExe) { Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue }
             Move-Item -LiteralPath $exeDest -Destination $oldExe -Force
         }
         try {
@@ -88,17 +88,29 @@ try {
         if (Test-Path -LiteralPath $oldExe) { Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue }
 
         # installer dari rilis dipakai supaya perbaikan installer ikut terpasang.
+        # Unduh ke file sementara dulu: gagal di tengah tidak boleh merusak skrip lama.
         $scriptDest = Join-Path $BinDir 'install.ps1'
+        $scriptTemp = Join-Path $BinDir 'install.ps1.tmp'
+        $scriptReady = $false
         try {
-            Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$tag/install.ps1" -OutFile $scriptDest -Headers @{ 'User-Agent' = 'mydns-installer' }
+            Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$tag/install.ps1" -OutFile $scriptTemp -Headers @{ 'User-Agent' = 'mydns-installer' }
+            $scriptReady = $true
         } catch {
             $source = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
             if ($source -and (Test-Path -LiteralPath $source) -and ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($scriptDest))) {
-                Copy-Item -LiteralPath $source -Destination $scriptDest -Force
-            } elseif (-not (Test-Path -LiteralPath $scriptDest)) {
-                Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/master/install.ps1" -OutFile $scriptDest -Headers @{ 'User-Agent' = 'mydns-installer' }
+                Copy-Item -LiteralPath $source -Destination $scriptTemp -Force
+                $scriptReady = $true
+            } elseif (Test-Path -LiteralPath $scriptDest) {
+                $scriptReady = $true  # yang lama masih utuh, jangan timpa
+            } else {
+                Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/master/install.ps1" -OutFile $scriptTemp -Headers @{ 'User-Agent' = 'mydns-installer' }
+                $scriptReady = $true
             }
         }
+        if ($scriptReady -and (Test-Path -LiteralPath $scriptTemp)) {
+            Move-Item -LiteralPath $scriptTemp -Destination $scriptDest -Force
+        }
+        if (Test-Path -LiteralPath $scriptTemp) { Remove-Item -LiteralPath $scriptTemp -Force -ErrorAction SilentlyContinue }
 
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         if ($userPath -notlike "*$BinDir*") {
