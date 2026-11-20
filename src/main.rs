@@ -6,6 +6,7 @@ mod log;
 mod providers;
 mod server;
 mod ui;
+mod updater;
 mod vpn;
 mod warp;
 mod win;

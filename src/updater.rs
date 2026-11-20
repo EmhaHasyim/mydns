@@ -1,0 +1,140 @@
+//! Pemeriksa versi rilis dan cache hasil pengecekan update.
+//
+// API ini dipakai oleh tugas berikutnya untuk pengecekan update GitHub.
+#![allow(dead_code)]
+
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+pub fn current() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Tag GitHub yang diterima: `v` diikuti tiga bilangan desimal.
+pub fn valid_tag(tag: &str) -> bool {
+    tag.strip_prefix('v')
+        .is_some_and(|rest| parse_version(rest).is_some())
+}
+
+/// Bandingkan tiga komponen versi; tag diawali `v`, versi lokal tidak.
+pub fn is_newer(tag: &str, current: &str) -> bool {
+    let Some(latest) = tag.strip_prefix('v').and_then(parse_version) else {
+        return false;
+    };
+    let Some(running) = parse_version(current) else {
+        return false;
+    };
+    latest > running
+}
+
+fn parse_version(text: &str) -> Option<[u64; 3]> {
+    let mut nums = [0u64; 3];
+    let mut parts = text.split('.');
+    for num in &mut nums {
+        let part = parts.next()?;
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *num = part.parse().ok()?;
+    }
+    parts.next().is_none().then_some(nums)
+}
+
+pub fn cache_path() -> PathBuf {
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("APPDATA"))
+        .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+    cache_file(base)
+}
+
+fn cache_file(base: impl AsRef<Path>) -> PathBuf {
+    base.as_ref().join("MyDns").join("update-check.json")
+}
+
+/// Hasil cache yang korup, tidak ada, atau sudah 24 jam tidak dianggap.
+pub fn latest_cached(now: SystemTime) -> Option<String> {
+    read_cached(&cache_path(), now)
+}
+
+pub fn save_cached(tag: &str, now: SystemTime) -> Result<(), String> {
+    write_cached(&cache_path(), tag, now)
+}
+
+#[derive(Deserialize)]
+struct CacheEntry {
+    checked_at: u64,
+    latest: String,
+}
+
+fn read_cached(path: &Path, now: SystemTime) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let entry: CacheEntry = serde_json::from_str(&raw).ok()?;
+    let secs = unix_secs(now);
+    if secs.saturating_sub(entry.checked_at) >= CACHE_TTL.as_secs() {
+        return None;
+    }
+    Some(entry.latest)
+}
+
+fn write_cached(path: &Path, tag: &str, now: SystemTime) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("gagal membuat {}: {e}", dir.display()))?;
+    }
+    let latest = serde_json::to_string(tag).map_err(|e| e.to_string())?;
+    let raw = format!(
+        r#"{{"checked_at": {}, "latest": {latest}}}"#,
+        unix_secs(now)
+    );
+    std::fs::write(path, raw).map_err(|e| format!("gagal menulis {}: {e}", path.display()))
+}
+
+fn unix_secs(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membandingkan_versi_dan_tag() {
+        assert!(is_newer("v0.2.0", "0.1.0"));
+        assert!(!is_newer("v0.1.0", "0.1.0"));
+        assert!(!is_newer("v0.0.9", "0.1.0"));
+        assert!(valid_tag("v1.2.3"));
+        assert!(!valid_tag("v1.2.3; calc"));
+        assert!(cache_path().ends_with("MyDns/update-check.json"));
+    }
+
+    #[test]
+    fn cache_ditulis_dan_kadaluarsa() {
+        let unique = unix_secs(SystemTime::now());
+        let base =
+            std::env::temp_dir().join(format!("mydns-updater-{unique}-{}", std::process::id()));
+        let path = cache_file(&base);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        write_cached(&path, "v1.2.3", now).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"checked_at": 1000000, "latest": "v1.2.3"}"#
+        );
+        assert_eq!(read_cached(&path, now).as_deref(), Some("v1.2.3"));
+        assert_eq!(
+            read_cached(&path, now + CACHE_TTL - Duration::from_secs(1)).as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(read_cached(&path, now + CACHE_TTL), None);
+
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(read_cached(&path, now), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
