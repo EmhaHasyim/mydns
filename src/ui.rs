@@ -841,7 +841,7 @@ impl App {
                 ]),
                 Line::from(vec![
                     Span::raw("   "),
-                    Span::styled(self.status.as_str(), fg(TEXT)),
+                    Span::styled(one_line(self.status.as_str(), area.width - 3), fg(TEXT)),
                 ]),
             ],
             _ => vec![Line::from(vec![
@@ -1687,6 +1687,20 @@ mod tests {
         ));
         let screen = screen(&app, 60, 16).join("\n");
         assert!(screen.contains("update"), "layar: {screen}");
+    }
+
+    #[test]
+    fn pengingat_update_tidak_memotong_status_panjang() {
+        let mut app = app();
+        app.on_msg(Msg::UpdateNotice(
+            "v0.2.0 tersedia — jalankan mydns update".into(),
+        ));
+        app.status = "status yang sangat panjang yang harus tetap terlihat di baris kedua".into();
+        let screen = screen(&app, 60, 16).join("\n");
+        assert!(
+            screen.contains("tetap terlihat di …"),
+            "status tidak dipotong rapi: {screen}"
+        );
     }
 
     #[test]
