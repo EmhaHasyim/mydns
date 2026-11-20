@@ -6,6 +6,7 @@ mod log;
 mod providers;
 mod server;
 mod ui;
+mod updater;
 mod vpn;
 mod warp;
 mod win;
@@ -13,8 +14,13 @@ mod win;
 use crate::log::Log;
 use crate::providers::{config_path, providers as resolver_list, read_config};
 use crate::win::{ProcessIdentity, parse_process_identity};
+use std::os::windows::process::CommandExt;
+use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime};
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn main() {
     let args: Vec<String> = std::env::args_os()
@@ -30,6 +36,11 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| is_version_flag(a)) {
+        println!("mydns {}", updater::current());
+        return;
+    }
+
     // Pendamping pemulihan (lihat win::spawn_watchdog). Tidak pernah
     // mengubah apa pun selama induknya masih hidup.
     if let Some(pos) = args.iter().position(|a| a == "--watchdog")
@@ -42,10 +53,13 @@ fn main() {
 
     let command = args
         .iter()
-        .find(|a| !a.starts_with('-'))
+        .find(|a| !a.starts_with('-') && !is_version_flag(a))
         .map(|s| s.as_str())
         .unwrap_or("");
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let positional: Vec<&String> = args
+        .iter()
+        .filter(|a| !a.starts_with('-') && !is_version_flag(a))
+        .collect();
 
     match command {
         "" | "tui" => cmd_tui(&args),
@@ -54,6 +68,7 @@ fn main() {
         "test" => cmd_test(),
         "providers" => cmd_providers(),
         "doctor" => cmd_doctor(),
+        "update" | "upgrade" => cmd_update(),
         "log" => cmd_log(
             positional
                 .get(1)
@@ -84,6 +99,10 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn is_version_flag(arg: &str) -> bool {
+    arg == "-v" || arg == "--version"
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -153,6 +172,104 @@ fn cmd_status() {
         }
         None => println!("\nTidak ada catatan MyDNS (DNS belum pernah diubah aplikasi ini)"),
     }
+    if let Some(warning) = update_warning() {
+        warn(&warning);
+    }
+}
+
+fn update_warning() -> Option<String> {
+    let tag = updater::latest_cached(SystemTime::now())?;
+    (updater::valid_tag(&tag) && updater::is_newer(&tag, updater::current()))
+        .then(|| format!("update tersedia: {tag} — jalankan mydns update"))
+}
+
+fn cmd_update() {
+    let tag = match updater::check_now() {
+        Ok(tag) => tag,
+        Err(e) => {
+            eprintln!("gagal: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !updater::valid_tag(&tag) {
+        eprintln!("gagal: tag rilis tidak valid: {tag}");
+        std::process::exit(1);
+    }
+    if updater::is_newer(&tag, updater::current()) {
+        cmd_install_update(&tag);
+    } else {
+        println!("sudah versi terbaru");
+    }
+}
+
+fn boleh_update(session_aktif: bool, port_dipakai_mydns: bool) -> bool {
+    !session_aktif && !port_dipakai_mydns
+}
+
+/// `control()` membuat runtime sendiri, jadi dipanggil di thread terpisah dan
+/// dibatasi 5 detik agar update tidak menggantung saat daemon tidak menjawab.
+fn daemon_aktif() -> bool {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(daemon::control("status").is_ok());
+    });
+    rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+}
+
+fn cmd_install_update(tag: &str) {
+    if !updater::valid_tag(tag) {
+        eprintln!("tag rilis tidak valid: {tag}");
+        std::process::exit(1);
+    }
+    let rt = runtime();
+    let port_dipakai_mydns = rt.block_on(server::probe()).is_ok();
+    let session_aktif = daemon_aktif();
+    if !boleh_update(session_aktif, port_dipakai_mydns) {
+        eprintln!("MyDNS masih aktif — tutup MyDNS / jalankan `mydns restore` dulu");
+        std::process::exit(1);
+    }
+    let Some(script) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("install.ps1")))
+        .filter(|path| path.exists())
+    else {
+        eprintln!(
+            "install.ps1 tidak ada di folder mydns.exe — jalankan installer dari repo: irm https://raw.githubusercontent.com/EmhaHasyim/mydns/master/install.ps1 | iex"
+        );
+        std::process::exit(1);
+    };
+    let out = Command::new(win::system32_exe(r"WindowsPowerShell\v1.0\powershell.exe"))
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .args(["-Update", "-Version", tag])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("gagal menjalankan installer update: {e}");
+            std::process::exit(1);
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.trim().is_empty() {
+        println!("{}", stdout.trim_end());
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("{}", stderr.trim_end());
+    }
+    if !out.status.success() {
+        eprintln!("installer update gagal: {}", out.status);
+        std::process::exit(1);
+    }
+    println!("update selesai");
 }
 
 fn cmd_restore(args: &[String]) {
@@ -327,6 +444,10 @@ fn cmd_doctor() {
         for error in config.errors.iter().take(3) {
             println!("         {error}");
         }
+    }
+
+    if let Some(warning) = update_warning() {
+        warn(&warning);
     }
 
     println!();
@@ -778,7 +899,10 @@ fn help() {
 
 PEMAKAIAN
   mydns                 buka TUI pemilih resolver
+  mydns -v, --version   tampilkan versi MyDNS
   mydns status          tampilkan DNS adapter yang aktif sekarang
+  mydns update          cek rilis terbaru dan perbarui MyDNS
+  mydns upgrade         alias untuk update
   mydns restore         kembalikan DNS ke setelan asli (DHCP / statis)
   mydns doctor          periksa kesehatan pengalihan DNS (tanpa mengubah apa pun)
   mydns log [n]         tampilkan n baris terakhir log peristiwa
@@ -819,4 +943,23 @@ CATATAN
   • Saat jaringan berganti, adapter yang DNS-nya ditimpa DHCP dikembalikan
     otomatis selama sesi berjalan."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opsi_versi_dikenali_sebelum_perintah() {
+        assert!(is_version_flag("--version"));
+        assert!(is_version_flag("-v"));
+        assert!(!is_version_flag("status"));
+    }
+
+    #[test]
+    fn update_ditolak_saat_sesi_aktif() {
+        assert!(!boleh_update(true, false));
+        assert!(!boleh_update(false, true));
+        assert!(boleh_update(false, false));
+    }
 }

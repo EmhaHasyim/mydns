@@ -9,6 +9,7 @@ use crate::engine::{Engine, build_query};
 use crate::log::Log;
 use crate::providers::{Proto, providers};
 use crate::server;
+use crate::updater;
 use crate::win;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
@@ -17,7 +18,7 @@ use ratatui::widgets::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Jarak pemeriksaan DNS adapter. Sepuluh detik masih cepat untuk kasus yang
 /// nyata (pindah Wi-Fi, bangun dari sleep) tapi tidak memanggil API adapter
@@ -91,6 +92,23 @@ fn text(content: impl Into<String>, style: Style) -> Line<'static> {
     Line::from(Span::styled(content.into(), style))
 }
 
+/// Potong satu baris teks dengan elipsis, memakai lebar sel terminal.
+fn one_line(content: &str, width: u16) -> String {
+    use ratatui::buffer::CellWidth;
+    let mut out = String::new();
+    let mut used = 0u16;
+    for ch in content.chars() {
+        let w = ch.to_string().cell_width();
+        if used + w > width.saturating_sub(1) {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
 /// Label bagian di dalam panel detail.
 fn heading(title: &'static str) -> Line<'static> {
     text(title, bold(ACCENT_DIM))
@@ -127,6 +145,8 @@ pub enum Msg {
     /// (device_id, endpoint) perangkat WARP. Dibaca sekali, bukan tiap frame:
     /// membaca `warp.json` berarti membuka kunci DPAPI.
     WarpDevice(Option<(String, String)>),
+    /// Tag rilis baru dari cache, ditampilkan di baris status tanpa jaringan.
+    UpdateNotice(String),
 }
 
 pub struct Session {
@@ -180,6 +200,7 @@ pub struct App {
     /// Latensi beberapa query terakhir per provider (maks 20), untuk p50 di
     /// panel detail.
     latencies: Vec<Vec<u128>>,
+    update_notice: Option<String>,
 }
 
 fn item_count() -> usize {
@@ -458,6 +479,7 @@ impl App {
                 self.dns_restored = false;
             }
             Msg::WarpDevice(device) => self.warp_device = device,
+            Msg::UpdateNotice(tag) => self.update_notice = Some(tag),
         }
     }
 
@@ -811,15 +833,29 @@ impl App {
             ("·", MUTED)
         };
 
-        let status = Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {symbol} "), fg(color)),
-            Span::styled(
-                self.status.as_str(),
-                fg(if self.is_error { ERR } else { TEXT }),
-            ),
-        ]))
-        .wrap(Wrap { trim: false })
-        .style(bg(SURFACE));
+        let lines = match self.update_notice.as_deref().filter(|_| !self.is_error) {
+            Some(notice) if area.width > 3 => vec![
+                Line::from(vec![
+                    Span::styled(format!(" {symbol} "), fg(color)),
+                    Span::styled(one_line(notice, area.width - 3), fg(WARN)),
+                ]),
+                Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(one_line(self.status.as_str(), area.width - 3), fg(TEXT)),
+                ]),
+            ],
+            _ => vec![Line::from(vec![
+                Span::styled(format!(" {symbol} "), fg(color)),
+                Span::styled(
+                    self.status.as_str(),
+                    fg(if self.is_error { ERR } else { TEXT }),
+                ),
+            ])],
+        };
+
+        let status = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(bg(SURFACE));
         frame.render_widget(status, area);
     }
 
@@ -1368,6 +1404,7 @@ pub fn run(
         exit_ip: None,
         warp_device: None,
         latencies: vec![Vec::new(); providers().len()],
+        update_notice: None,
     };
 
     // Baca DNS aktif di latar belakang supaya frame pertama tidak tertahan.
@@ -1376,6 +1413,23 @@ pub fn run(
         app.rt.spawn(async move {
             if let Ok(summary) = tokio::task::spawn_blocking(win::summary).await {
                 let _ = tx.send(Msg::Status(summary));
+            }
+        });
+    }
+
+    // Pengingat update memakai cache saja: jangan blokir render dengan jaringan.
+    {
+        let tx = app.tx.clone();
+        app.rt.spawn(async move {
+            let cached =
+                tokio::task::spawn_blocking(|| updater::latest_cached(SystemTime::now())).await;
+            if let Ok(Some(tag)) = cached
+                && updater::valid_tag(&tag)
+                && updater::is_newer(&tag, updater::current())
+            {
+                let _ = tx.send(Msg::UpdateNotice(format!(
+                    "update tersedia: {tag} — jalankan mydns update"
+                )));
             }
         });
     }
@@ -1485,6 +1539,7 @@ mod tests {
             exit_ip: None,
             warp_device: None,
             latencies: vec![Vec::new(); providers().len()],
+            update_notice: None,
         }
     }
 
@@ -1621,6 +1676,30 @@ mod tests {
         assert!(
             text.contains("IP 104.28.215.130"),
             "IP keluar terpotong di terminal sempit: {text}"
+        );
+    }
+
+    #[test]
+    fn pengingat_update_muat_di_terminal_kecil() {
+        let mut app = app();
+        app.on_msg(Msg::UpdateNotice(
+            "v0.2.0 tersedia — jalankan mydns update".into(),
+        ));
+        let screen = screen(&app, 60, 16).join("\n");
+        assert!(screen.contains("update"), "layar: {screen}");
+    }
+
+    #[test]
+    fn pengingat_update_tidak_memotong_status_panjang() {
+        let mut app = app();
+        app.on_msg(Msg::UpdateNotice(
+            "v0.2.0 tersedia — jalankan mydns update".into(),
+        ));
+        app.status = "status yang sangat panjang yang harus tetap terlihat di baris kedua".into();
+        let screen = screen(&app, 60, 16).join("\n");
+        assert!(
+            screen.contains("tetap terlihat di …"),
+            "status tidak dipotong rapi: {screen}"
         );
     }
 

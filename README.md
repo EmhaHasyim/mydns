@@ -3,8 +3,31 @@
 Ganti DNS Windows 11 ke **DoQ / DoH3** (DNS lewat QUIC) supaya lebih cepat dan
 lebih privat. Windows belum bisa memakai dua protokol ini.
 
-MyDNS satu file `.exe` (mode VPN juga butuh `wintun.dll` di folder yang sama),
-tidak perlu install, tidak menyisakan layanan.
+MyDNS terdiri dari `mydns.exe` dan `wintun.dll` saat memakai VPN; tidak
+menyisakan layanan. Bisa dipakai langsung dari repo atau dipasang dengan
+installer.
+
+## Install & Update
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/EmhaHasyim/mydns/master/install.ps1 | iex"
+mydns -v
+mydns update    # alias: mydns upgrade
+```
+
+Installer menaruh biner di `%LOCALAPPDATA%\MyDns\bin` dan menambahkan folder
+itu ke `PATH` user. Buka PowerShell baru setelah install agar `PATH` terbaru
+terbaca; `mydns -v` menampilkan versi yang terpasang. `dns.cmd` dari repo juga
+masih bisa dipakai untuk menjalankan biner hasil build lokal.
+
+`mydns update` mengecek rilis GitHub terbaru. Update ditolak saat MyDNS masih
+aktif — tutup MyDNS atau jalankan `mydns restore` dulu. Pengingat update muncul
+di TUI, `mydns status`, dan `mydns doctor`. Instalasi dan update memerlukan
+rilis GitHub yang sudah dipublikasikan; kalau belum ada, perintah melaporkan
+`rilis GitHub belum tersedia`.
+
+Konfigurasi WARP dan resolver ada di `%APPDATA%\MyDns`, sedangkan cache
+pengecekan update dan log ada di `%LOCALAPPDATA%\MyDns`.
 
 ## Cara pakai
 
