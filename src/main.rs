@@ -31,6 +31,11 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| is_version_flag(a)) {
+        println!("mydns {}", updater::current());
+        return;
+    }
+
     // Pendamping pemulihan (lihat win::spawn_watchdog). Tidak pernah
     // mengubah apa pun selama induknya masih hidup.
     if let Some(pos) = args.iter().position(|a| a == "--watchdog")
@@ -43,10 +48,13 @@ fn main() {
 
     let command = args
         .iter()
-        .find(|a| !a.starts_with('-'))
+        .find(|a| !a.starts_with('-') && !is_version_flag(a))
         .map(|s| s.as_str())
         .unwrap_or("");
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let positional: Vec<&String> = args
+        .iter()
+        .filter(|a| !a.starts_with('-') && !is_version_flag(a))
+        .collect();
 
     match command {
         "" | "tui" => cmd_tui(&args),
@@ -55,6 +63,7 @@ fn main() {
         "test" => cmd_test(),
         "providers" => cmd_providers(),
         "doctor" => cmd_doctor(),
+        "update" | "upgrade" => cmd_update(),
         "log" => cmd_log(
             positional
                 .get(1)
@@ -85,6 +94,10 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn is_version_flag(arg: &str) -> bool {
+    arg == "-v" || arg == "--version"
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -154,6 +167,24 @@ fn cmd_status() {
         }
         None => println!("\nTidak ada catatan MyDNS (DNS belum pernah diubah aplikasi ini)"),
     }
+}
+
+fn cmd_update() {
+    match updater::check_now() {
+        Ok(tag) if updater::valid_tag(&tag) && updater::is_newer(&tag, updater::current()) => {
+            cmd_install_update(&tag)
+        }
+        Ok(_) => println!("sudah versi terbaru"),
+        Err(e) => {
+            eprintln!("gagal: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// Sementara: Task 5 akan mengganti ini dengan instalasi biner dari GitHub.
+fn cmd_install_update(tag: &str) {
+    println!("rilis {tag} ditemukan, tetapi installer belum disertakan dalam biner ini");
 }
 
 fn cmd_restore(args: &[String]) {
@@ -779,7 +810,10 @@ fn help() {
 
 PEMAKAIAN
   mydns                 buka TUI pemilih resolver
+  mydns -v, --version   tampilkan versi MyDNS
   mydns status          tampilkan DNS adapter yang aktif sekarang
+  mydns update          cek rilis terbaru dan perbarui MyDNS
+  mydns upgrade         alias untuk update
   mydns restore         kembalikan DNS ke setelan asli (DHCP / statis)
   mydns doctor          periksa kesehatan pengalihan DNS (tanpa mengubah apa pun)
   mydns log [n]         tampilkan n baris terakhir log peristiwa
@@ -820,4 +854,16 @@ CATATAN
   • Saat jaringan berganti, adapter yang DNS-nya ditimpa DHCP dikembalikan
     otomatis selama sesi berjalan."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opsi_versi_dikenali_sebelum_perintah() {
+        assert!(is_version_flag("--version"));
+        assert!(is_version_flag("-v"));
+        assert!(!is_version_flag("status"));
+    }
 }
