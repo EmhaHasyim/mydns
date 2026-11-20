@@ -22,7 +22,9 @@ masih bisa dipakai untuk menjalankan biner hasil build lokal.
 
 `mydns update` mengecek rilis GitHub terbaru. Update ditolak saat MyDNS masih
 aktif — tutup MyDNS atau jalankan `mydns restore` dulu. Pengingat update muncul
-di TUI, `mydns status`, dan `mydns doctor`.
+di TUI, `mydns status`, dan `mydns doctor`. Instalasi dan update memerlukan
+rilis GitHub yang sudah dipublikasikan; kalau belum ada, perintah melaporkan
+`rilis GitHub belum tersedia`.
 
 Konfigurasi WARP dan resolver ada di `%APPDATA%\MyDns`, sedangkan cache
 pengecekan update dan log ada di `%LOCALAPPDATA%\MyDns`.
