@@ -80,6 +80,14 @@ fn latest_from_json(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn tag_from_output(body: &str) -> Option<String> {
+    let text = body.trim();
+    if valid_tag(text) {
+        return Some(text.to_string());
+    }
+    latest_from_json(text)
+}
+
 pub fn check_now() -> Result<String, String> {
     let script = "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-RestMethod -Uri 'https://api.github.com/repos/EmhaHasyim/mydns/releases/latest' -Headers @{'User-Agent'='mydns-update'}).tag_name";
     let out = Command::new(crate::win::system32_exe(
@@ -101,7 +109,7 @@ pub fn check_now() -> Result<String, String> {
             detail.trim()
         ));
     }
-    let tag = latest_from_json(stdout.trim()).ok_or("rilis GitHub belum tersedia")?;
+    let tag = tag_from_output(&stdout).ok_or("rilis GitHub belum tersedia")?;
     save_cached(&tag, SystemTime::now())?;
     Ok(tag)
 }
@@ -155,6 +163,12 @@ mod tests {
             latest_from_json(r#"{"message":"API rate limit exceeded"}"#).as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn tag_output_powershell_diterima() {
+        assert_eq!(tag_from_output("v0.2.0\r\n").as_deref(), Some("v0.2.0"));
+        assert_eq!(tag_from_output("v1.2.3; calc").as_deref(), None);
     }
 
     #[test]
